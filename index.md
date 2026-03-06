@@ -27,9 +27,9 @@ If you are looking for Linux binary LOLBins you should visit [GTFOBins][]. For W
 [MITRE ATT&CK® Navigator](https://mitre-attack.github.io/attack-navigator/#layerURL={{ '/mitre.json' | absolute_url }})
 {:.centered}
 
-[contributors]: https://github.com/L0Lweb/WebShellBins/graphs/contributors
+[contributors]: https://github.com/L0Lweb/LOLWeb.github.io/graphs/contributors
 [GTFOBins]: https://gtfobins.github.io/
 [LOLBAS]: https://lolbas-project.github.io/
-[GitHub]: https://github.com/L0Lweb/WebShellBins
+[GitHub]: https://github.com/L0Lweb/LOLWeb.github.io
 
 <div>{%- include lolwebs_table.html -%}</div>

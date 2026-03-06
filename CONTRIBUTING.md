@@ -120,6 +120,6 @@ This validates both the schema and the formatting of YAML files. If formatting i
 Use `make clean` to clean up the build environment.
 
 [YAML]: https://yaml.org/
-[`_data/functions.yml`]: https://github.com/L0Lweb/WebShellBins/blob/master/_data/functions.yml
-[`_data/contexts.yml`]: https://github.com/L0Lweb/WebShellBins/blob/master/_data/contexts.yml
-[`_lolwebs/`]: https://github.com/L0Lweb/WebShellBins/tree/master/_lolwebs
+[`_data/functions.yml`]: https://github.com/L0Lweb/LOLWeb.github.io/blob/main/_data/functions.yml
+[`_data/contexts.yml`]: https://github.com/L0Lweb/LOLWeb.github.io/blob/main/_data/contexts.yml
+[`_lolwebs/`]: https://github.com/L0Lweb/LOLWeb.github.io/tree/main/_lolwebs
