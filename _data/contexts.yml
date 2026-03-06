@@ -1,0 +1,27 @@
+unauthenticated:
+  label: Unauthenticated
+  description: No credentials required. Exploitable by any attacker with network access to the target.
+
+authenticated:
+  label: Authenticated
+  description: Requires valid credentials for a standard (low-privilege) user account.
+
+admin:
+  label: Admin
+  description: Requires administrative or privileged account access to the application.
+
+console:
+  label: Script Console
+  description: Executed via the application's built-in scripting or admin console (e.g., Jenkins /script, Rails console).
+
+ci_cd:
+  label: CI/CD Pipeline
+  description: Executed as a build step or pipeline job (e.g., Jenkinsfile, .gitlab-ci.yml).
+
+api_token:
+  label: API Token
+  description: Requires a valid API token with sufficient permissions to access the injection point.
+
+plugin:
+  label: Plugin/Extension
+  description: Exploited via installation or modification of a plugin, theme, or extension.

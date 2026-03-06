@@ -1,0 +1,9 @@
+{%- comment -%} lookup a lolweb entry by name and return it via the return_lolweb and return_lolweb_name variables {%- endcomment -%}
+{%- for _lolweb in site.lolwebs -%}
+    {%- capture _lolweb_name -%}{%- include get_lolweb_name.html path=_lolweb.path -%}{%- endcapture -%}
+    {%- if _lolweb_name == include.name -%}
+        {%- assign return_lolweb_name = _lolweb_name -%}
+        {%- assign return_lolweb = _lolweb -%}
+        {%- break -%}
+    {%- endif -%}
+{%- endfor -%}

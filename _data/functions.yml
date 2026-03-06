@@ -1,0 +1,78 @@
+rce:
+  label: RCE
+  description: Execute arbitrary OS commands on the server and retrieve their output.
+  mitre:
+  - T1059
+  - T1190
+  extra:
+    blind: &blind
+      true: Commands are executed but output is not returned to the attacker — use out-of-band channels (DNS/HTTP callback) to confirm execution.
+
+reverse-shell:
+  label: Reverse Shell
+  description: Establish an interactive reverse shell back to the attacker's listener.
+  mitre:
+  - T1059
+  - T1071
+  extra:
+    tty: &tty
+      false: The spawned shell is not a full TTY — interactive programs and tab completion may not work correctly.
+    blind: *blind
+    listener:
+      tcp-server:
+        comment: Start a TCP listener on the attacker machine to receive the shell.
+        code: nc -lvnp 12345
+      tcp-server-tty:
+        comment: Use socat for a fully interactive TTY reverse shell.
+        code: socat file:/dev/tty,raw,echo=0 tcp-listen:12345
+      tls-server:
+        comment: Use a TLS listener to encrypt the reverse shell channel.
+        code: |-
+          openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+          openssl s_server -quiet -key key.pem -cert cert.pem -port 12345
+
+bind-shell:
+  label: Bind Shell
+  description: Bind an interactive shell to a local port on the target, waiting for the attacker to connect.
+  mitre:
+  - T1059
+  - T1071
+  extra:
+    tty: *tty
+    blind: *blind
+    connector:
+      tcp-client:
+        comment: Connect to the bind shell from the attacker machine.
+        code: nc victim.com 12345
+      tcp-client-tty:
+        comment: Use socat for a fully interactive TTY session.
+        code: socat file:/dev/tty,raw,echo=0 tcp:victim.com:12345
+
+webshell:
+  label: Web Shell
+  description: Deploy a persistent web shell file on the server, enabling subsequent code execution via HTTP requests.
+  mitre:
+  - T1505
+
+file-read:
+  label: File Read
+  description: Read arbitrary files from the server filesystem, potentially exposing credentials, secrets, or sensitive configuration.
+  mitre:
+  - T1005
+  extra:
+    binary: &binary
+      false: The content may be corrupted or altered, making it unsuitable for arbitrary binary data.
+
+file-write:
+  label: File Write
+  description: Write arbitrary content to the server filesystem, potentially enabling webshell deployment or configuration tampering.
+  mitre:
+  - T1565
+  extra:
+    binary: *binary
+
+ssrf:
+  label: SSRF
+  description: Trigger outbound HTTP requests from the server to internal or external resources, potentially exposing internal services or cloud metadata endpoints.
+  mitre:
+  - T1090
