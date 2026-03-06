@@ -2,7 +2,7 @@ name: Pages
 on:
   push:
     branches:
-      - master
+      - main
 permissions:
   contents: read
   pages: write
@@ -21,7 +21,7 @@ jobs:
         id: pages
         uses: actions/configure-pages@v5
       - name: Build Jekyll
-        run: bundle exec jekyll build
+        run: bundle exec jekyll build --baseurl "${{ steps.pages.outputs.base_path }}"
         env:
           JEKYLL_ENV: production
       - name: Upload artifact
