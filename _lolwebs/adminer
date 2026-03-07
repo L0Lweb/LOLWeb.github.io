@@ -13,6 +13,23 @@ comment: |
      Elasticsearch login driver makes an outbound HTTP request to the server URL
      specified in the login form without validation, enabling arbitrary HTTP requests
      from the Adminer server to internal network endpoints.
+docker:
+  compose: "services:\n  adminer:\n    image: adminer:4.6.2\n    ports:\n      - \"\
+    8080:8080\"\n    depends_on:\n      - db\n  db:\n    image: mysql:5.7\n    environment:\n\
+    \      MYSQL_ROOT_PASSWORD: root\n      MYSQL_DATABASE: testdb\n"
+  note: 'Starts Adminer 4.6.2 (vulnerable to the rogue MySQL file-read) backed by
+    MySQL 5.7.
+
+    Access Adminer at `http://localhost:8080`.
+
+    Log in with server `db`, username `root`, password `root`, database `testdb`.
+
+    To test the rogue MySQL file-read, run the server script on your host and set
+    the
+
+    Adminer server field to `host.docker.internal:3306`.
+
+    '
 functions:
   file-read:
   - code: "#!/usr/bin/env python3\n# Rogue MySQL server \u2014 reads an arbitrary\

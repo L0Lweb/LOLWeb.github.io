@@ -10,6 +10,21 @@ comment: "Drupal is a PHP-based CMS. Three independent exploitation paths exist:
   \ a contrib module.\n\n3. Custom module upload \u2014 any admin user with \"administer\
   \ modules\" permission can install\n   a ZIP archive containing arbitrary PHP files,\
   \ which are then served directly by the\n   web server from the modules directory.\n"
+docker:
+  compose: "services:\n  drupal:\n    image: drupal:8.5.0-apache\n    ports:\n   \
+    \   - \"8080:80\"\n    depends_on:\n      - db\n  db:\n    image: postgres:10\n\
+    \    environment:\n      POSTGRES_DB: drupal\n      POSTGRES_USER: drupal\n  \
+    \    POSTGRES_PASSWORD: drupal\n"
+  note: 'Starts Drupal 8.5.0 (vulnerable to CVE-2018-7600 Drupalgeddon2) with PostgreSQL
+    10.
+
+    Access at `http://localhost:8080`. Complete the Drupal installer on first visit
+
+    using database host `db`, name `drupal`, user `drupal`, password `drupal`.
+
+    Run `docker compose up -d && sleep 20` before browsing to allow the DB to initialise.
+
+    '
 functions:
   bind-shell:
   - code: |

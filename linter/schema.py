@@ -103,6 +103,10 @@ _SCHEMA = schema.Or(
     },
     {
         schema.Optional('comment'): _string,
+        schema.Optional('docker'): {
+            schema.Optional('note'): _string,
+            schema.Optional('compose'): _string,
+        },
         'functions': schema.And(len, {
             **_function('rce', {
                 **_blind,

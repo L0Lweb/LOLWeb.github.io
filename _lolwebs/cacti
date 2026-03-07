@@ -6,6 +6,18 @@ comment: |
   database; the X-Forwarded-For header bypasses this check. The poller_id
   parameter is appended unsanitized to a shell command string passed to proc_open.
   Affects Cacti <= 1.2.22. Listed in the CISA KEV catalog.
+docker:
+  compose: "services:\n  cacti:\n    image: vulhub/cacti:1.2.22\n    ports:\n    \
+    \  - \"8080:80\"\n    depends_on:\n      - db\n    environment:\n      DB_HOST:\
+    \ db\n      DB_USER: cacti\n      DB_PASS: cacti\n      DB_NAME: cacti\n  db:\n\
+    \    image: mysql:5.7\n    environment:\n      MYSQL_ROOT_PASSWORD: root\n   \
+    \   MYSQL_DATABASE: cacti\n      MYSQL_USER: cacti\n      MYSQL_PASSWORD: cacti\n"
+  note: "Uses the Vulhub lab image for CVE-2022-46169 (Cacti 1.2.22 + MySQL 5.7).\n\
+    Access Cacti at `http://localhost:8080`. Default credentials: `admin` / `admin`.\n\
+    After first login, add a device (e.g. localhost / 127.0.0.1) so that `host_id=1`\n\
+    and `local_data_ids[0]=1` exist in the database \u2014 required for the injection\
+    \ to fire.\nRun `docker compose up -d && sleep 30` to give the DB time to initialise\
+    \ before browsing.\n"
 functions:
   rce:
   - code: |
@@ -49,6 +61,7 @@ functions:
     contexts:
       unauthenticated:
     listener: tcp-server
+    platform: linux
     tty: false
     version: |-
       <= 1.2.22

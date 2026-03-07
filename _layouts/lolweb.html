@@ -169,6 +169,19 @@ layout: common
     </div>
 {%- endfor -%}
 
+{%- comment -%} optional docker lab section {%- endcomment -%}
+{%- if lolweb.docker -%}
+<details class="lab-section">
+    <summary>Lab environment</summary>
+    {%- if lolweb.docker.note -%}
+        {{ lolweb.docker.note | markdownify }}
+    {%- endif -%}
+    {%- if lolweb.docker.compose -%}
+        <pre><code>{{- lolweb.docker.compose | escape | strip -}}</code></pre>
+    {%- endif -%}
+</details>
+{%- endif -%}
+
 {%- comment -%} footer with some GitHub links about this executable {%- endcomment -%}
 <p class="small centered">
   <a class="small-link" href="https://github.com/L0Lweb/LOLWeb.github.io/blob/main/_lolwebs/{{ lolweb_name }}">Source</a>

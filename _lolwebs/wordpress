@@ -5,6 +5,23 @@ comment: |
   File Editor, Plugins > Plugin File Editor) and the ability to install arbitrary plugins or themes.
   These features are enabled by default; `DISALLOW_FILE_EDIT` and `DISALLOW_FILE_MODS` constants
   disable them when set in `wp-config.php`.
+docker:
+  compose: "services:\n  wordpress:\n    image: wordpress:6.0\n    ports:\n      -\
+    \ \"8080:80\"\n    depends_on:\n      - db\n    environment:\n      WORDPRESS_DB_HOST:\
+    \ db\n      WORDPRESS_DB_NAME: wordpress\n      WORDPRESS_DB_USER: wordpress\n\
+    \      WORDPRESS_DB_PASSWORD: wordpress\n  db:\n    image: mysql:8\n    environment:\n\
+    \      MYSQL_ROOT_PASSWORD: root\n      MYSQL_DATABASE: wordpress\n      MYSQL_USER:\
+    \ wordpress\n      MYSQL_PASSWORD: wordpress\n"
+  note: 'Starts WordPress 6.0 with MySQL 8. Access at `http://localhost:8080`.
+
+    Complete the WordPress installer on first visit. Run `docker compose up -d &&
+    sleep 20`
+
+    to allow MySQL to initialise before browsing. Default credentials set during install.
+
+    The theme/plugin editor and plugin upload are available under admin credentials.
+
+    '
 functions:
   bind-shell:
   - code: |

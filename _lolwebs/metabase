@@ -11,6 +11,21 @@ comment: |
 
   Affects Metabase open source < 0.46.6.1 and Enterprise < 1.46.6.1.
   Listed in the CISA KEV catalog; actively exploited in the wild.
+docker:
+  compose: "services:\n  metabase:\n    image: metabase/metabase:v0.46.6\n    ports:\n\
+    \      - \"3000:3000\"\n    environment:\n      MB_DB_TYPE: h2\n"
+  note: 'Starts Metabase v0.46.6 (vulnerable to CVE-2023-38646 pre-auth RCE via H2
+    JDBC).
+
+    Access at `http://localhost:3000`. Complete the setup wizard on first visit to
+    obtain
+
+    the `setup-token` needed for the exploit (printed in startup logs and returned
+    by
+
+    `/api/session/properties`). Run `docker compose up -d && sleep 30` before browsing.
+
+    '
 functions:
   rce:
   - blind: true

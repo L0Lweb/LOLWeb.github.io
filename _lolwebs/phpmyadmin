@@ -11,6 +11,22 @@ comment: "phpMyAdmin is a PHP-based web interface for MySQL/MariaDB administrati
   \ then including it through a crafted target= parameter.\n\nCommon webroot paths:\
   \ /var/www/html (Debian/Ubuntu), /var/www (older Debian),\n/srv/http (Arch), C:\\\
   xampp\\htdocs (XAMPP), C:\\wamp64\\www (WampServer).\n"
+docker:
+  compose: "services:\n  phpmyadmin:\n    image: phpmyadmin:4.8.1\n    ports:\n  \
+    \    - \"8080:80\"\n    depends_on:\n      - db\n    environment:\n      PMA_HOST:\
+    \ db\n      PMA_USER: root\n      PMA_PASSWORD: root\n  db:\n    image: mysql:5.7\n\
+    \    command: --secure-file-priv=''\n    environment:\n      MYSQL_ROOT_PASSWORD:\
+    \ root\n      MYSQL_DATABASE: testdb\n"
+  note: 'Starts phpMyAdmin 4.8.1 (vulnerable to CVE-2018-12613 local file inclusion)
+    backed
+
+    by MySQL 5.7 with `secure_file_priv` disabled (required for OUTFILE webshell writes).
+
+    Access phpMyAdmin at `http://localhost:8080`. Log in with server `db`, user `root`,
+
+    password `root`. The MySQL data directory is exposed at `/var/lib/mysql`.
+
+    '
 functions:
   bind-shell:
   - code: |

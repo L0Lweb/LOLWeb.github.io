@@ -64,6 +64,7 @@ functions:
 | `binary`    | No       | `false` if the function cannot handle binary data (defaults to `true`).    |
 | `listener`  | No       | Listener type for `reverse-shell`. Use a key from `_data/functions.yml`.   |
 | `connector` | No       | Connector type for `bind-shell`. Use a key from `_data/functions.yml`.     |
+| `docker`    | No       | Optional lab environment. Has two sub-keys: `note` (markdown prose) and `compose` (raw YAML compose snippet). Rendered as a foldable section on the page. |
 
 Valid contexts: `unauthenticated`, `authenticated`, `admin`, `console`, `ci_cd`, `api_token`, `plugin`
 

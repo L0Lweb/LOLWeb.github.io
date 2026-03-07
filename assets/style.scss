@@ -613,6 +613,39 @@ h2, h3, h4, h5, h5 {
     font-style: italic;
 }
 
+// docker lab section
+
+details.lab-section {
+    border: 1px solid $faint;
+    margin: 1em 0;
+    padding: 0 1em;
+
+    summary {
+        color: $accent;
+        font-size: $small-font-size;
+        cursor: pointer;
+        padding: 0.5em 0;
+        user-select: none;
+
+        &::-webkit-details-marker {
+            display: none;
+        }
+
+        &::marker {
+            content: none;
+        }
+    }
+
+    &[open] > summary {
+        border-bottom: 1px solid $faint;
+        margin-bottom: 0.5em;
+    }
+
+    p {
+        text-align: left;
+    }
+}
+
 // other classes
 
 .accent {

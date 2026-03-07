@@ -11,6 +11,18 @@ comment: "Spring Boot Actuator exposes management endpoints (by default under /a
   \ containing JNDI directives, triggering RCE on Java < 8u191 / < 11.0.1.\n3. /actuator/env\
   \ + /actuator/refresh \u2014 set application properties to point to\n   attacker-controlled\
   \ services (SSRF via Eureka, RCE via H2 datasource query).\n"
+docker:
+  compose: "services:\n  gateway:\n    image: vulhub/spring-cloud-gateway:3.0.6\n\
+    \    ports:\n      - \"8080:8080\"\n"
+  note: 'Uses the Vulhub lab image for CVE-2022-22947 (Spring Cloud Gateway 3.0.6,
+
+    unauthenticated SPEL injection via the Actuator API).
+
+    Access at `http://localhost:8080`. The `/actuator` endpoints are exposed without
+
+    authentication. Run `docker compose up -d && sleep 10` before sending requests.
+
+    '
 functions:
   bind-shell:
   - blind: true

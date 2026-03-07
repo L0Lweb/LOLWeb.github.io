@@ -12,6 +12,14 @@ comment: "Jupyter Notebook is a Python-based interactive computing environment c
   \ to communicate.\n\nPayloads below use the kernel API with the websocket-client\
   \ Python package, which works\nagainst both classic Notebook and JupyterLab. Install\
   \ with: pip install requests websocket-client\n"
+docker:
+  compose: "services:\n  jupyter:\n    image: jupyter/minimal-notebook:latest\n  \
+    \  ports:\n      - \"8888:8888\"\n    command: >\n      start-notebook.sh\n  \
+    \    --NotebookApp.token=''\n      --NotebookApp.password=''\n      --NotebookApp.allow_origin='*'\n"
+  note: "Starts a Jupyter Notebook server with authentication completely disabled\
+    \ \u2014 no token,\nno password. Access at `http://localhost:8888`. All kernel\
+    \ execution, file read/write,\nand terminal endpoints are available without credentials,\
+    \ matching the `unauthenticated`\ncontext in every entry above.\n"
 functions:
   bind-shell:
   - code: |

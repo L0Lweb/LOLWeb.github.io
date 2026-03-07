@@ -14,6 +14,13 @@ comment: "Grafana is an open-source analytics and monitoring platform. Three pri
   \ cloud metadata endpoints.\n   Affects Grafana 3.0.1 through 7.0.2.\n\nA fourth\
   \ vector (admin): configuring a MSSQL data source allows executing xp_cmdshell\n\
   OS commands if the linked SQL Server has it enabled.\n"
+docker:
+  compose: "services:\n  grafana:\n    image: grafana/grafana:8.3.0\n    ports:\n\
+    \      - \"3000:3000\"\n    environment:\n      GF_SECURITY_ADMIN_PASSWORD: admin\n"
+  note: "Starts Grafana 8.3.0 (vulnerable to CVE-2021-43798 path traversal file-read).\n\
+    Access at `http://localhost:3000`. Default credentials: `admin` / `admin`.\nThe\
+    \ path traversal works without authentication \u2014 no login required for the\
+    \ `file-read` entry.\n"
 functions:
   bind-shell:
   - blind: true
