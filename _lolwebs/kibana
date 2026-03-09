@@ -139,20 +139,18 @@ functions:
       curl -s -X GET \
         "http://victim.com:5601/api/console/proxy?path=http://10.0.0.1:8080/api/v1/&method=GET" \
         -H "kbn-xsrf: true"
-    comment: |
-      Kibana's Dev Tools console at /app/dev_tools exposes /api/console/proxy, which
-      forwards HTTP requests server-side to the configured Elasticsearch host by default,
-      but in many versions also accepts arbitrary target URLs in the path parameter.
-      The full response body is returned inline in the API response — making this a
-      full-read SSRF primitive for any authenticated Kibana user.
-      Cloud metadata endpoints:
-      - AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/
-      - GCP:        http://metadata.google.internal/computeMetadata/v1/
-      - Azure:      http://169.254.169.254/metadata/instance?api-version=2021-02-01
-    version: |-
-      All versions — arbitrary URL proxying was restricted in Kibana 7.x+; on hardened
-      or recent installs the proxy may be limited to the configured Elasticsearch host only.
-      Verify by checking the elasticsearch.hosts allowlist in kibana.yml.
+    comment: "Kibana's Dev Tools console at /app/dev_tools exposes /api/console/proxy,\
+      \ which\nforwards HTTP requests server-side to the configured Elasticsearch\
+      \ host by default,\nbut in many versions also accepts arbitrary target URLs\
+      \ in the path parameter.\nThe full response body is returned inline in the API\
+      \ response \u2014 making this a\nfull-read SSRF primitive for any authenticated\
+      \ Kibana user.\nCloud metadata endpoints:\n- AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/\n\
+      - GCP:        http://metadata.google.internal/computeMetadata/v1/\n- Azure:\
+      \      http://169.254.169.254/metadata/instance?api-version=2021-02-01\n"
     contexts:
       authenticated:
+    version: "All versions \u2014 arbitrary URL proxying was restricted in Kibana\
+      \ 7.x+; on hardened\nor recent installs the proxy may be limited to the configured\
+      \ Elasticsearch host only.\nVerify by checking the elasticsearch.hosts allowlist\
+      \ in kibana.yml."
 ...

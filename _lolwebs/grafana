@@ -166,11 +166,11 @@ functions:
               "from": "now-1h", "to": "now"
           }
       )
-    comment: |
-      CVE-2024-9264: spawns a reverse bash shell via the DuckDB shellfs extension.
-      The shell runs as the grafana-server process user (typically grafana or root in containers).
-      The HTTP response returns immediately — check the listener for the incoming connection.
-      Requires SQL Expressions enabled (feature_toggles.sqlExpressions = true) and DuckDB on PATH.
+    comment: "CVE-2024-9264: spawns a reverse bash shell via the DuckDB shellfs extension.\n\
+      The shell runs as the grafana-server process user (typically grafana or root\
+      \ in containers).\nThe HTTP response returns immediately \u2014 check the listener\
+      \ for the incoming connection.\nRequires SQL Expressions enabled (feature_toggles.sqlExpressions\
+      \ = true) and DuckDB on PATH.\n"
     contexts:
       authenticated:
     listener: tcp-server

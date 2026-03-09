@@ -144,11 +144,10 @@ functions:
 
       # Access the deployed servlet (path matches the servlet-key in atlassian-plugin.xml):
       curl "http://victim.com:8090/plugins/servlet/shell?c=id"
-    comment: |
-      Confluence does not have a built-in scripting console. Admin-level RCE requires
-      a plugin (JAR) that registers a servlet calling Runtime.getRuntime().exec().
-      The plugin is hot-deployed — no server restart required.
-      Combine with CVE-2023-22515 to first elevate to admin on unpatched 8.x targets.
+    comment: "Confluence does not have a built-in scripting console. Admin-level RCE\
+      \ requires\na plugin (JAR) that registers a servlet calling Runtime.getRuntime().exec().\n\
+      The plugin is hot-deployed \u2014 no server restart required.\nCombine with\
+      \ CVE-2023-22515 to first elevate to admin on unpatched 8.x targets.\n"
     contexts:
       admin:
   reverse-shell:
