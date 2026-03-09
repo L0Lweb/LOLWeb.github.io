@@ -12,7 +12,7 @@ Inspired by [GTFOBins](https://gtfobins.github.io/) and [LOLBAS](https://lolbas-
 
 ## Entries
 
-Drupal · GitLab · Grafana · Jenkins · Joomla · Jupyter Notebook · phpMyAdmin · Spring Boot Actuator · Tomcat · WordPress
+Adminer · Airflow · AWX · Cacti · Confluence · Drupal · Gitea · GitLab · GLPI · Grafana · Jenkins · Joomla · Jupyter Notebook · Kibana · Liferay · Metabase · Moodle · Nexus Repository · phpMyAdmin · Portainer · Roundcube · Spring Boot Actuator · SuiteCRM · TeamCity · Tomcat · Webmin · WordPress · Zabbix
 
 ## Features
 

