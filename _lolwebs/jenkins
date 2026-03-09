@@ -143,7 +143,7 @@ functions:
     contexts:
       unauthenticated:
     version: |-
-      < 2.441 / LTS < 2.426.3
+      <= 2.441 / LTS <= 2.426.2
   - code: |
       println new File("/etc/passwd").text
     comment: |
