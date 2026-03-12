@@ -534,6 +534,13 @@ h2, h3, h4, h5, h5 {
         flex-shrink: 0;
     }
 
+    .payload-fields {
+        display: flex;
+        align-items: center;
+        gap: 1.5rem;
+        flex-wrap: wrap;
+    }
+
     .platform-toggle {
         display: flex;
         border: 1px solid $faint;

